@@ -211,6 +211,8 @@ def analyze_source(context: str, symbol: str, folder: Path) -> dict:
         raise ValueError("Clang source diagnostics unavailable")
     start, end = owner_source._definition_span(context, symbol)
     pruned = owner_source._pruned_ast_context(context, symbol, context[start:end])
+    if not pruned.endswith("\n"):
+        pruned += "\n"  # -Wall -Werror rejects a missing final newline on newer Clang
     source = folder / "analysis.c"
     source.write_text(pruned, encoding="utf-8", newline="\n")
     # C99 parses the project's existing inline/header extensions; the assigned

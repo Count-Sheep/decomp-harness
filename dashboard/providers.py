@@ -273,7 +273,18 @@ def newest(root: Path, paths) -> dict[str, Any] | None:
     if latest is None:
         return None
     return {"at": datetime.fromtimestamp(latest[0] / 1e9, UTC).isoformat(),
-            "path": latest[1].relative_to(root).as_posix(), "mtime_ns": latest[0]}
+            "path": _relative(latest[1], root, resolved), "mtime_ns": latest[0]}
+
+
+def _relative(path: Path, root: Path, resolved: Path) -> str:
+    """``path`` below ``root``, tolerating symlinked temp dirs and Windows 8.3 short names."""
+    for base in (resolved, root):
+        for candidate in (path, path.resolve()):
+            try:
+                return candidate.relative_to(base).as_posix()
+            except ValueError:
+                pass
+    return path.name
 
 
 _digests: dict[tuple[str, int, int], str] = {}

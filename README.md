@@ -24,56 +24,243 @@ to one of two things: SHA-1-gated unit promotion (`--auto-promote`), or the draf
 campaign's `run --promote`, which commits improvements after a rebuilt report
 shows that no function lost score.
 
-## Requirements
+## Dependencies
 
-- Python 3.11 or later, and Git. No third-party Python packages are needed for
-  the core.
-- Windows, Linux or macOS. On Windows MWCC runs natively. Elsewhere the harness
-  runs it through [wibo](https://github.com/decompals/wibo), from the project's
-  `build/tools/wibo` or from `PATH`, or through Wine.
-- For each plugged-in project: a dtk-template checkout that builds with
-  `python configure.py && ninja`, so that it has `build/<VERSION>/report.json`,
-  `build/tools/objdiff-cli` and `build/compilers/`.
-- An m2c checkout at the base revision named in
-  [`harness/m2c_patches/NOTICE.txt`](harness/m2c_patches/NOTICE.txt), with the
-  harness's patches applied (see below).
-- Optional:
-  - [decomp-permuter](https://github.com/simonlindholm/decomp-permuter) with
-    the harness's small patch series, plus PowerPC binutils, for the permuter
-    farm. Clang is needed only for full-owner mode. See
-    [harness/permuter/README.md](harness/permuter/README.md).
-  - A local model server (llama.cpp, Ollama, vLLM and so on), for the draft
-    campaign.
-  - `claude-agent-sdk` (`harness/requirements-agent-sdk.txt`), for the
-    engineering lane.
-  - `psutil`, for richer process info in the dashboard.
+### Required
 
-## Quick start
+| Dependency | Why | How to get it |
+|---|---|---|
+| Python 3.11+ | runs the harness, dashboard and projects' `configure.py` | [python.org](https://www.python.org/downloads/), or your package manager. On Windows tick "Add python.exe to PATH". |
+| Git | clones m2c and corpora, applies patches, runs gates | [git-scm.com](https://git-scm.com/downloads); Git for Windows on Windows |
+| Ninja | builds the plugged-in project | `winget install Ninja-build.Ninja`, `brew install ninja`, `apt install ninja-build`, or `pip install ninja` |
+| A dtk-template decomp | the project the harness works on (see step 2) | the project's own repository, plus your own disc image |
+| m2c | generates drafts; the harness applies its own patch series (step 4) | cloned from [matt-kempster/m2c](https://github.com/matt-kempster/m2c) |
+
+The core harness and dashboard use only the Python standard library. The
+project's build downloads its own compilers, `dtk`, `objdiff-cli`, `sjiswrap`
+and PowerPC binutils into its `build/` directory.
+
+### Platform notes
+
+- **Windows**: MWCC runs natively, so nothing else is needed.
+- **Linux / macOS**: MWCC is a Windows program. dtk-template projects download
+  [wibo](https://github.com/decompals/wibo) into `build/tools/wibo`
+  automatically on x86 Linux. Otherwise install wibo or Wine and put it on
+  `PATH`, or set `tools.compiler_wrapper`.
+- **WSL** works like Linux. Keep checkouts on the Linux filesystem for speed.
+
+### Optional, per feature
+
+| Feature | Needs |
+|---|---|
+| Permuter farm | [decomp-permuter](https://github.com/simonlindholm/decomp-permuter) with the harness patch series (step 8), `pip install toml`, and PowerPC binutils (downloaded by the project build) |
+| Permuter full-owner mode, source-package gate | Clang on `PATH` |
+| Draft campaign / model benchmark | any OpenAI-compatible model server: [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`, [Ollama](https://ollama.com), vLLM, … |
+| Claude m2c engineering lane | `pip install -r harness/requirements-agent-sdk.txt` and an Anthropic API key |
+| Project trial / auto-promote extras | `pip install -r harness/requirements-project-trial.txt` |
+| Ghidra bootstrap evidence | [Ghidra](https://ghidra-sre.org) (`analyzeHeadless`) |
+| Dashboard process details | `pip install psutil` (it falls back to built-in process listing without it) |
+| Frontend tests | Node.js 18+ |
+
+## Setup
+
+Run the commands from the harness repository root. Use `python` on Windows and
+`python3` where that is the interpreter's name.
+
+### 1. Get the harness
 
 ```sh
-git clone <this repository> decomp-harness
+git clone https://github.com/Count-Sheep/decomp-harness.git
 cd decomp-harness
-
-# 1. Plug in a project: copy the example and edit the root/version.
-cp harness.example.json harness.local.json         # Windows: copy harness.example.json harness.local.json
-
-# 2. Install m2c and apply the harness patches. autocrlf must be off so the
-#    patches apply byte-exact (Git for Windows turns it on by default).
-git clone --config core.autocrlf=false https://github.com/matt-kempster/m2c build/tools/m2c
-git -C build/tools/m2c checkout 708d2d2cb2698f091a92492b328f73b24209f72d
-python harness/local_campaign_m2c_patch.py
-
-# 3. Build the project once (in its own checkout) so the report and tools exist,
-#    then generate and validate drafts for every eligible function.
-python harness/m2c_pipeline_runner.py --jobs 4 --validation-jobs 4 --context-declarations --readonly-data
-
-# 4. Watch it.
-python dashboard/server.py --open
+python scripts/run_tests.py          # optional: confirms the install (no project needed)
 ```
 
-Use `python` on Windows and `python3` where that is the interpreter's name.
+### 2. Build the decomp you want to work on
+
+The harness drives an existing [dtk-template](https://github.com/encounter/dtk-template)
+project. In that project's checkout, place your legally obtained disc image (ISO,
+RVZ, …) or its extracted files under `orig/<GAMEID>/`, as the project's README
+describes. Then build it once:
+
+```sh
+cd ../your-decomp
+python configure.py
+ninja                                # builds, checks build.sha1, writes build/<VERSION>/report.json
+```
+
+The build must finish byte-exact (`ninja` prints `N files OK`) before the
+harness will draft anything. If a project fails to build on Windows, see
+[Windows notes for project maintainers](#windows-notes-for-project-maintainers).
+
+### 3. Plug the project in
+
+```sh
+cd ../decomp-harness
+cp harness.example.json harness.local.json        # Windows: copy harness.example.json harness.local.json
+```
+
+Edit `harness.local.json` and set the project's `id`, `name`, `root` (the
+checkout path, relative to this file) and `version` (the `config/<VERSION>`
+directory name):
+
+```json
+{
+  "default_project": "mygame",
+  "projects": [
+    {"id": "mygame", "name": "My game", "root": "../your-decomp", "version": "GAME01", "references": ["sibling"]},
+    {"id": "sibling", "name": "Sibling decomp (evidence only)", "root": "../sibling-decomp", "version": "GAME02"}
+  ]
+}
+```
+
+Check the selection:
+
+```sh
+python -c "import sys; sys.path.insert(0, 'harness'); import harness_paths as h; print(h.PROJECT_ID, h.DECOMP_ROOT, h.VERSION)"
+```
+
+### 4. Install m2c with the harness patches
+
+`core.autocrlf` must stay off so the patches apply byte-exact. Git for Windows
+turns it on by default, and `--config` keeps it off for this clone.
+
+```sh
+git clone --config core.autocrlf=false https://github.com/matt-kempster/m2c build/tools/m2c
+git -C build/tools/m2c checkout 708d2d2cb2698f091a92492b328f73b24209f72d
+python harness/local_campaign_m2c_patch.py        # prints "applied" (or "already_applied")
+```
+
+### 5. Add cross-project evidence (recommended)
+
+See [Cross-project evidence](#cross-project-evidence) for why this matters.
+Add sibling decomps to `projects[]` and list them in your project's
+`references`, add public corpora to `reference_corpora[]`, then build the
+corpora:
+
+```sh
+python harness/reference_corpus.py sync           # shallow-clones each configured corpus
+python harness/reference_corpus.py build --jobs 8 # compiles matching source with the right MWCC and indexes it
+python harness/reference_corpus.py status
+```
+
+### 6. Run the m2c pipeline
+
+```sh
+python harness/m2c_pipeline_runner.py --jobs 8 --validation-jobs 8 --context-declarations --readonly-data
+```
+
+This drafts every unmatched function, validates each draft in a scratch
+workspace with the project's own compiler flags, and runs bounded refinement and
+owner-unit gates. Results go in `<project>/build/decomp-support/<VERSION>/`.
+Nothing in the project changes unless you add `--auto-promote`, which commits a
+unit only after the full build still matches every SHA-1.
+
+### 7. Watch it
+
+```sh
+python dashboard/server.py --open                 # http://127.0.0.1:8765
+```
+
+### 8. Permuter farm (optional)
+
+```sh
+# a permuter checkout with the harness patches, in the project's default farm location
+git clone --config core.autocrlf=false https://github.com/simonlindholm/decomp-permuter ../your-decomp/build/permuter-farm/decomp-permuter
+git -C ../your-decomp/build/permuter-farm/decomp-permuter checkout 8556c81
+python harness/permuter/apply_permuter_patches.py --root ../your-decomp/build/permuter-farm/decomp-permuter
+python -m pip install toml
+
+# queue near-matches as a TSV: tier, pct, size, name, addr, unit (see harness/permuter/README.md)
+python harness/permuter/gen_workunits.py --queue build/permuter_queue.tsv --limit 20
+python harness/permuter/farm.py --workers 8 --budget 600
+```
+
+Wins land in `<project>/build/permuter_results/` for review. The dashboard picks
+up the farm automatically.
+
+### 9. Local-LLM draft campaign (optional)
+
+Start any OpenAI-compatible server, for example `llama-server -m MODEL.gguf --port 8080`
+or `ollama serve`. Then:
+
+```sh
+python harness/local_campaign.py sync
+python harness/local_campaign.py --worker w1 --ollama-host http://127.0.0.1:11434 --model MODEL run --retries 12
+```
+
+See [docs/LOCAL_LLM_CAMPAIGN.md](docs/LOCAL_LLM_CAMPAIGN.md) for workers, claims
+and the model benchmark.
+
 Every command defaults to the selected project and its version.
 `--root`/`--version` or the environment variables below override that.
+
+## Cross-project evidence
+
+GameCube and Wii games share a lot of code that was compiled from the same
+source: the Dolphin/Revolution SDK, the MSL C runtime, MetroTRK, middleware
+such as JSystem, and engine code a studio reused across its games. Once one
+decomp has matched a function like that, others can learn from it. The harness
+uses two kinds of evidence.
+
+- **Reference projects**: other decomp checkouts listed in `projects[]` and
+  named in your project's `references`. Only their exact, source-backed functions
+  are used. If a reference project is also built (its own `report.json`), its
+  retail bytes can be compared directly.
+- **Reference corpora**: public decomps listed in `reference_corpora[]`. These
+  don't need that game's disc. `reference_corpus.py` compiles only the source
+  upstream marks as matching, with the compiler version upstream uses, then
+  indexes the resulting assembly next to its C.
+
+How the evidence improves results:
+
+1. **Exact reuse.** If a target function's bytes are identical to an already
+   matched function elsewhere (common for SDK and runtime code), the draft
+   starts from that known-good C instead of a guess, and gains priority.
+2. **Similar matched examples.** Every target is scored against the reference
+   pool by opcode mix, size, control flow, calls and stack frame. The closest
+   matched functions, with their real C, go into the draft's context and the
+   model prompts. Seeing how a structurally similar function was written is the
+   main way the context turns into code that matches.
+3. **Types and declarations.** Matched references bring real prototypes,
+   struct layouts and extern declarations. m2c's typed context then emits
+   fewer `?`/`M2C_ERROR` placeholders and compiles more often.
+4. **Compiler profile.** References carry the MWCC version and flags they
+   matched with, which helps choose settings for units that share a library.
+5. **Templates and library lookups.** The template index and the draft
+   campaign's library-reference lookup search the same pool by normalized
+   instruction shape and by symbol name.
+
+More evidence helps most when it shares the target's SDK version, compiler
+version or engine. Corpora from unrelated codebases mostly add noise. A run
+records how much evidence it used: the m2c report lists `reference_pool`,
+`reference_projects` and `reference_examples`, and the dashboard shows them.
+
+Example corpus entries (the format is documented in
+[`harness/reference_corpus.py`](harness/reference_corpus.py)):
+
+```json
+"reference_corpora": [
+  {
+    "name": "dolsdk2001",
+    "url": "https://github.com/doldecomp/dolsdk2001.git",
+    "license": "see upstream",
+    "role": "Dolphin SDK source",
+    "jobs": {
+      "kind": "sources",
+      "sources": ["src/**/*.c"],
+      "compiler": "GC/1.2.5",
+      "flags": "-char unsigned -nodefaults -proc gekko -fp hard -Cpp_exceptions off -enum int -O4,p -inline auto -I- -Iinclude -Iinclude/libc -ir src -DRELEASE",
+      "object_dir": "build/release"
+    }
+  }
+]
+```
+
+`"kind": "configure"` instead reads a dtk-template project's `configure.py` and
+takes its `Object(Matching, ...)` entries for the library functions you name.
+Corpus checkouts and indexes go in this repository's ignored `build/`, and
+compilers come from `tools.reference_toolchain` (any built dtk-template checkout;
+default: the selected project).
 
 ## Configuration
 
@@ -139,28 +326,13 @@ reference corpora and the reference registry.
 | `docs/` | detailed documentation |
 | `scripts/run_tests.py` | cross-platform test runner |
 
-## Common commands
-
-Run these from the repository root:
+## More commands
 
 ```sh
-# m2c pipeline
-python harness/m2c_pipeline_runner.py --jobs 4 --validation-jobs 4 --context-declarations --readonly-data [--auto-promote]
-python harness/m2c_drafts.py --limit 200 --executor local=4 --executor http://127.0.0.1:8766=8
-python harness/m2c_validate_drafts.py [--batch DIR]
-python harness/m2c_remote_worker.py --tool build/tools/m2c --cache build/m2c-worker-cache   # on a worker machine
-
-# permuter farm
-python harness/permuter/gen_workunits.py --help
-python harness/permuter/farm.py --help
-
-# local-LLM draft campaign
-python harness/local_campaign.py sync
-python harness/local_campaign.py --worker w1 --ollama-host http://127.0.0.1:11434 --model MODEL run --retries 12 --recycle
-python harness/local_campaign_bench.py queue bench/queue.local.json --stage prelim
-
-# dashboard
-python dashboard/server.py --open
+python harness/m2c_drafts.py --limit 200 --executor local=4 --executor http://127.0.0.1:8766=8   # drafts only, with a remote worker
+python harness/m2c_validate_drafts.py [--batch DIR]                                               # validate an existing batch
+python harness/m2c_remote_worker.py --tool build/tools/m2c --cache build/m2c-worker-cache          # on a worker machine
+python harness/local_campaign_bench.py queue bench/queue.local.json --stage prelim                # model benchmark
 ```
 
 Remote m2c workers bind to loopback by default. Reach them through an SSH
