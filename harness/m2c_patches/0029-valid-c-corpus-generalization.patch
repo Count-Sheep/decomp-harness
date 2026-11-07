@@ -1,0 +1,167 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 1b78c7b..0cf7814 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -5,6 +5,7 @@ from contextlib import contextmanager
+ from dataclasses import dataclass, field, replace
+ from enum import Enum, auto
+ import math
++import re
+ import struct
+ import sys
+ import traceback
+@@ -124,8 +125,16 @@ class Arch(ArchFlowGraph, ArchC):
+     ir_patterns: List[IrPattern] = []
+ 
+     def c_symbol_name(self, asm_name: str) -> str:
+-        """Convert an assembler symbol name to its C spelling."""
+-        return asm_name
++        """Convert an assembler symbol name to its C spelling.
++
++        Assembler symbol names may contain characters that are not valid in C
++        identifiers (e.g. mangled C++ names like `foo<Bar>Ff` or linker-local
++        names like `foo$123`). Such characters are replaced with underscores
++        so that the generated code is syntactically valid C.
++        """
++        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", asm_name):
++            return asm_name
++        return re.sub(r"[^A-Za-z0-9_]", "_", asm_name)
+ 
+     def simplify_ir(
+         self, asm_data: AsmData, flow_graph: FlowGraph, *, debug_patterns: bool
+@@ -1382,6 +1391,31 @@ class BinaryOp(Condition):
+         if self.op in ("==", "!=") and isinstance(right_expr, Literal):
+             right_expr = elide_literal_casts(as_type(right_expr, left_expr.type, True))
+ 
++        # Comparing a pointer against a plain integer is illegal in C; make the
++        # mismatch explicit with a cast on the non-pointer side so the emitted
++        # code compiles regardless of how the two operands' abstract types were
++        # unified internally.
++        if (
++            fmt.valid_syntax
++            and self.is_comparison()
++            and left_expr.type.is_pointer_or_array()
++            != right_expr.type.is_pointer_or_array()
++        ):
++            if left_expr.type.is_pointer_or_array():
++                right_expr = Cast(
++                    expr=right_expr,
++                    reinterpret=True,
++                    silent=False,
++                    type=left_expr.type.decay(),
++                )
++            else:
++                left_expr = Cast(
++                    expr=left_expr,
++                    reinterpret=True,
++                    silent=False,
++                    type=right_expr.type.decay(),
++                )
++
+         # For commutative, left-associative operations, strip unnecessary parentheses.
+         lhs = left_expr.format(fmt)
+         if (
+@@ -2957,6 +2991,13 @@ def should_wrap_transparently(expr: Expression) -> bool:
+         and isinstance(expr.struct_var, AddressOf)
+         and isinstance(expr.struct_var.expr, GlobalSymbol)
+         and should_wrap_transparently(expr.struct_var.expr)
++        # Only treat this as "free" to duplicate when the offset is small
++        # enough to be folded into a single memory instruction (e.g. a 16-bit
++        # immediate offset). Larger offsets typically require a separate
++        # high/low address computation (e.g. `addis`/`lui`); duplicating that
++        # computation at every use site needlessly bloats the generated code
++        # and can cause it to diverge from a shared-base-register original.
++        and -0x8000 <= expr.offset < 0x8000
+     ):
+         # Don't emit temps for reads of globals: they are usually compiler
+         # generated, and prevent_later_var_uses/prevent_later_reads tend to be
+@@ -4909,7 +4950,8 @@ class GlobalInfo:
+ 
+                 qualifier = f"{qualifier} " if qualifier else ""
+                 value = f" = {value}" if value else ""
+-                declaration = sym.type.to_decl(name, fmt)
++                decl_name = sym.c_symbol_name
++                declaration = sym.type.to_decl(decl_name, fmt)
+                 signature = sym.type.data().fn_sig
+                 if (fmt.valid_syntax and not sym.type_provided and signature is not None
+                         and signature.return_type.is_unconstrained()):
+@@ -4918,7 +4960,7 @@ class GlobalInfo:
+                     ctype = sym.type._to_ctype(set(), fmt)
+                     if isinstance(ctype, ca.FuncDecl):
+                         ctype.type = Type.void()._to_ctype(set(), fmt)
+-                        declaration = type_to_string(ctype, name)
++                        declaration = type_to_string(ctype, decl_name)
+                         comments.append("return value unused")
+                 if decls == Options.GlobalDeclsEnum.USED_CONTEXT and not is_in_file and sym.type_provided:
+                     # Keep qualifiers and authoritative prototypes from context.
+diff --git a/tests/unit/test_c_symbol_name.py b/tests/unit/test_c_symbol_name.py
+new file mode 100644
+index 0000000..dede901
+--- /dev/null
++++ b/tests/unit/test_c_symbol_name.py
+@@ -0,0 +1,27 @@
++from pathlib import Path
++import tempfile
++import unittest
++
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestCSymbolName(unittest.TestCase):
++    def test_invalid_assembler_name_is_consistent_in_call_and_declaration(self):
++        with tempfile.TemporaryDirectory() as name:
++            root = Path(name)
++            (root / "target.s").write_text(
++                '.fn test, global\nbl "thisExec__5@unnamed@foo_cpp@Bar"\nblr\n.endfn test\n')
++            (root / "context.c").write_text("void test(void);")
++            output = decompile_and_capture_output(parse_flags([
++                "-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache",
++                "--no-unk-inference", "--globals", "used-context",
++                "--context", str(root / "context.c"), str(root / "target.s")]))
++        spelling = "thisExec__5_unnamed_foo_cpp_Bar"
++        self.assertNotIn("@", output)
++        self.assertIn(f"void {spelling}(", output)
++        self.assertIn(f"{spelling}();", output)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/unit/test_pointer_offsets.py b/tests/unit/test_pointer_offsets.py
+index bc23532..1eb7196 100644
+--- a/tests/unit/test_pointer_offsets.py
++++ b/tests/unit/test_pointer_offsets.py
+@@ -5,11 +5,32 @@ import subprocess
+ import tempfile
+ 
+ from m2c.options import Formatter
+-from m2c.translate import BinaryOp, GlobalSymbol, Literal, format_assignment
++from m2c.translate import (AddressOf, BinaryOp, GlobalSymbol, Literal, StructAccess,
++                           format_assignment, should_wrap_transparently)
+ from m2c.types import Type
+ 
+ 
+ class TestPointerOffsets(unittest.TestCase):
++    def test_valid_syntax_casts_both_orders_of_pointer_integer_comparisons(self):
++        fmt = Formatter(valid_syntax=True)
++        pointer = GlobalSymbol("cursor", Type.ptr(Type.u32()))
++        integer = GlobalSymbol("raw", Type.s32())
++        self.assertEqual(BinaryOp(pointer, "==", integer, Type.boolean()).format(fmt),
++                         "(cursor == (u32 *) raw)")
++        self.assertEqual(BinaryOp(integer, "!=", pointer, Type.boolean()).format(fmt),
++                         "((u32 *) raw != cursor)")
++        self.assertEqual(BinaryOp(pointer, "==", integer, Type.boolean()).format(Formatter()),
++                         "(cursor == raw)")
++
++    def test_large_global_offsets_are_materialized_at_signed_16_bit_boundary(self):
++        global_value = GlobalSymbol("table", Type.array(Type.u8(), 0x10000))
++        base = AddressOf(global_value)
++        for offset, transparent in ((-0x8000, True), (0x7FFF, True),
++                                    (-0x8001, False), (0x8000, False)):
++            access = StructAccess(base, offset, 4, [0], None, Type.u32())
++            with self.subTest(offset=offset):
++                self.assertEqual(should_wrap_transparently(access), transparent)
++
+     def test_unsized_pointer_offsets_use_bytes_in_valid_syntax(self):
+         fmt = Formatter(valid_syntax=True)
+         for target in (None, Type.any(), Type.void()):

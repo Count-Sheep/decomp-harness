@@ -1,0 +1,119 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index bc36541..290c49a 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1303,7 +1303,7 @@ class BinaryOp(Condition):
+                 return expr
+         return self
+ 
+-    def pointer_offset(self) -> Optional[Tuple[Expression, Expression, int]]:
++    def pointer_offset(self, include_unsized: bool = False) -> Optional[Tuple[Expression, Expression, int]]:
+         if self.op not in ("+", "-"):
+             return None
+         base, offset = late_unwrap(self.left), late_unwrap(self.right)
+@@ -1313,7 +1313,7 @@ class BinaryOp(Condition):
+             return None
+         target = base.type.decay().get_pointer_target()
+         size = target.get_size_bytes() if target else None
+-        return (base, offset, size) if size else None
++        return (base, offset, size or 0) if size or include_unsized else None
+ 
+     def format(self, fmt: Formatter) -> str:
+         left_expr = late_unwrap(self.left)
+@@ -1323,10 +1323,13 @@ class BinaryOp(Condition):
+         if adj is not self:
+             return adj.format(fmt)
+ 
+-        pointer = self.pointer_offset()
++        pointer = self.pointer_offset(include_unsized=fmt.valid_syntax)
+         if pointer is not None:
+             base, offset, size = pointer
+             # Register arithmetic uses bytes; C pointer arithmetic uses elements.
++            if not size:
++                result_type = self.type if self.type.is_pointer() or self.type.is_int() else base.type.decay()
++                return f"(({result_type.format(fmt)}) ((char *) {base.format(fmt)} {self.op} {offset.format(fmt)}))"
+             if isinstance(offset, Literal) and size and offset.value % size == 0:
+                 elements = Literal(offset.value // size, type=Type.s32())
+                 return f"({base.format(fmt)} {self.op} {elements.format(fmt)})"
+@@ -3032,7 +3035,7 @@ def format_assignment(
+     source = late_unwrap(source)
+     if isinstance(source, BinaryOp) and source.op in COMPOUND_ASSIGNMENT_OPS:
+         source = source.normalize_for_formatting()
+-        pointer = source.pointer_offset()
++        pointer = source.pointer_offset(include_unsized=fmt.valid_syntax)
+         if pointer is not None:
+             base, offset, size = pointer
+             if is_dest(base) and isinstance(offset, Literal) and size and offset.value % size == 0:
+diff --git a/tests/end_to_end/misc1/irix-o2-validsyntax-out.c b/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
+index ad70a25..7d8132b 100644
+--- a/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
++++ b/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
+@@ -21,6 +21,6 @@ s32 test(s32 arg0, M2C_UNK arg1) {
+     }
+     sp28 = temp_v0_2;
+     func_00400158(sp24, temp_v0_2, temp_a2);
+-    *(&D_410178 + arg0) = 5;
++    *((s8 *) ((char *) &D_410178 + arg0)) = 5;
+     return sp28;
+ }
+diff --git a/tests/unit/test_native_drafts.py b/tests/unit/test_native_drafts.py
+index f8bc448..7ead9fa 100644
+--- a/tests/unit/test_native_drafts.py
++++ b/tests/unit/test_native_drafts.py
+@@ -69,6 +69,18 @@ class TestNativeDrafts(unittest.TestCase):
+         code = self.translate("li r3,1\nb lookup", "const char *test(void); const char *lookup();")
+         self.assertIn("const char *lookup(s32);", code)
+ 
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for raw C syntax checks")
++    def test_void_pointer_byte_offset_is_valid_c89(self):
++        code = self.translate("addi r3,r3,12\nblr", "void *test(void *base);")
++        self.assertIn("(char *)", code)
++        with tempfile.TemporaryDirectory() as name:
++            path = Path(name) / "draft.c"
++            path.write_text(code)
++            run = subprocess.run([shutil.which("clang"), "-target", "powerpc-unknown-none",
++                                  "-std=c89", "-pedantic-errors", "-fsyntax-only", "-Werror", str(path)],
++                                 capture_output=True, text=True, timeout=30)
++            self.assertEqual(run.returncode, 0, code + run.stderr)
++
+     @unittest.skipUnless(shutil.which("clang"), "Clang required for raw C syntax checks")
+     def test_integer_address_expression_produces_compilable_raw_load(self):
+         code = self.translate("add r3,r3,r4\nlwz r3,0(r3)\nblr",
+diff --git a/tests/unit/test_pointer_offsets.py b/tests/unit/test_pointer_offsets.py
+index 37acec3..c9ea94a 100644
+--- a/tests/unit/test_pointer_offsets.py
++++ b/tests/unit/test_pointer_offsets.py
+@@ -6,6 +6,33 @@ from m2c.types import Type
+ 
+ 
+ class TestPointerOffsets(unittest.TestCase):
++    def test_unsized_pointer_offsets_use_bytes_in_valid_syntax(self):
++        fmt = Formatter(valid_syntax=True)
++        for target in (None, Type.any(), Type.void()):
++            pointer = GlobalSymbol('cursor', Type.ptr(target))
++            for op in ('+', '-'):
++                for offset in (Literal(4), GlobalSymbol('step', Type.s32())):
++                    with self.subTest(target=target, op=op, offset=offset):
++                        expr = BinaryOp(pointer, op, offset, pointer.type)
++                        expected = f'((void *) ((char *) cursor {op} {offset.format(fmt)}))'
++                        self.assertEqual(expr.format(fmt), expected)
++                        assignment = format_assignment(pointer, expr, fmt)
++                        self.assertIn('cursor = ', assignment)
++                        self.assertNotIn(f'cursor {op}=', assignment)
++
++    def test_unsized_pointer_integer_result_and_commuted_addition(self):
++        fmt = Formatter(valid_syntax=True)
++        pointer = GlobalSymbol('cursor', Type.ptr())
++        expr = BinaryOp(Literal(4), '+', pointer, Type.s32())
++        self.assertEqual(expr.format(fmt), '((s32) ((char *) cursor + 4))')
++        self.assertEqual(expr.format(Formatter()), '(4 + cursor)')
++
++    def test_unsized_pointer_difference_is_not_an_offset(self):
++        pointer = GlobalSymbol('cursor', Type.ptr())
++        other = GlobalSymbol('end', Type.ptr())
++        expr = BinaryOp(pointer, '-', other, Type.s32())
++        self.assertIsNone(expr.pointer_offset(include_unsized=True))
++
+     def test_literal_offsets_are_converted_from_bytes_without_changing_the_ir(self):
+         for element in (Type.u8(), Type.u16(), Type.u32(), Type.u64()):
+             size = element.get_size_bytes()

@@ -1,0 +1,72 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 2bfd447..e3a5b4e 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1351,10 +1351,11 @@ class BinaryOp(Condition):
+         pointer = self.pointer_offset(include_unsized=fmt.valid_syntax)
+         if pointer is not None:
+             base, offset, size = pointer
++            result_type = (self.type if self.type.data().kind in
++                           (TypeData.K_INT, TypeData.K_PTR, TypeData.K_INTPTR) else base.type.decay())
+             # Register arithmetic uses bytes; C pointer arithmetic uses elements.
+-            if not size or (fmt.valid_syntax and base.type.is_recursive_pointer()):
+-                result_type = (self.type if self.type.data().kind in
+-                               (TypeData.K_INT, TypeData.K_PTR, TypeData.K_INTPTR) else base.type.decay())
++            if not size or (fmt.valid_syntax and (base.type.is_recursive_pointer()
++                    or result_type.format(fmt) != base.type.decay().format(fmt))):
+                 return f"(({result_type.format(fmt)}) ((char *) {base.format(fmt)} {self.op} {offset.format(fmt)}))"
+             if isinstance(offset, Literal) and size and offset.value % size == 0:
+                 elements = Literal(offset.value // size, type=Type.s32())
+diff --git a/tests/unit/test_pointer_offsets.py b/tests/unit/test_pointer_offsets.py
+index ed6c910..bc23532 100644
+--- a/tests/unit/test_pointer_offsets.py
++++ b/tests/unit/test_pointer_offsets.py
+@@ -1,4 +1,8 @@
+ import unittest
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
+ 
+ from m2c.options import Formatter
+ from m2c.translate import BinaryOp, GlobalSymbol, Literal, format_assignment
+@@ -33,6 +37,39 @@ class TestPointerOffsets(unittest.TestCase):
+         expr = BinaryOp(pointer, '-', other, Type.s32())
+         self.assertIsNone(expr.pointer_offset(include_unsized=True))
+ 
++    def test_sized_offset_preserves_the_inferred_result_representation(self):
++        fmt = Formatter(valid_syntax=True)
++        for element in (Type.u8(), Type.u32()):
++            pointer = GlobalSymbol('cursor', Type.ptr(element))
++            for result in (Type.s32(), Type.intptr(), Type.ptr(Type.ptr(Type.u8()))):
++                for offset in (Literal(8), GlobalSymbol('step', Type.s32())):
++                    for op in ('+', '-'):
++                        expr = BinaryOp(pointer, op, offset, result)
++                        expected = f'(({result.format(fmt)}) ((char *) cursor {op} {offset.format(fmt)}))'
++                        self.assertEqual(expr.format(fmt), expected)
++        pointer = GlobalSymbol('cursor', Type.ptr(Type.u32()))
++        expr = BinaryOp(pointer, '+', Literal(8), Type.s32())
++        self.assertEqual(expr.format(Formatter()), '(cursor + 2)')
++        self.assertEqual(pointer.type.format(fmt), 'u32 *')
++
++    @unittest.skipUnless(shutil.which('clang'), 'Clang required for C89 syntax checks')
++    def test_sized_result_conversions_compile_as_powerpc_c89(self):
++        fmt = Formatter(valid_syntax=True)
++        source = 'typedef unsigned char u8; typedef unsigned int u32; typedef int s32;\n'
++        for index, element in enumerate((Type.u8(), Type.u32())):
++            pointer = GlobalSymbol('cursor', Type.ptr(element))
++            for suffix, result in (('integer', Type.s32()), ('pointer', Type.ptr(Type.ptr(Type.u8())))):
++                expr = BinaryOp(pointer, '-', GlobalSymbol('step', Type.s32()), result)
++                source += (f'{result.format(fmt)} test_{index}_{suffix}({pointer.type.format(fmt)} cursor, s32 step) '
++                           f'{{ return {expr.format(fmt)}; }}\n')
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'draft.c'
++            path.write_text(source)
++            result = subprocess.run([shutil.which('clang'), '-target', 'powerpc-unknown-none',
++                                     '-std=c89', '-fsyntax-only', '-Werror', str(path)],
++                                    capture_output=True, text=True, timeout=30)
++            self.assertEqual(result.returncode, 0, source + result.stderr)
++
+     def test_unsized_offset_matches_ambiguous_register_declaration(self):
+         fmt = Formatter(valid_syntax=True)
+         pointer = GlobalSymbol('cursor', Type.ptr())

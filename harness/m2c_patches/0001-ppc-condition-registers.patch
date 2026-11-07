@@ -1,0 +1,298 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+index 018f2b7..d9171c4 100644
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -755,6 +755,11 @@ class PpcArch(Arch):
+             ]
+         ]
+     )
++    temp_regs += [
++        Register(f"cr{field}_{bit}")
++        for field in (1, 5, 6, 7)
++        for bit in ("lt", "gt", "eq", "so")
++    ]
+     saved_regs = [
+         Register(r)
+         for r in [
+@@ -802,6 +807,12 @@ class PpcArch(Arch):
+             "f31",
+         ]
+     ]
++    # CR2-CR4 are nonvolatile in the PowerPC EABI.
++    saved_regs += [
++        Register(f"cr{field}_{bit}")
++        for field in (2, 3, 4)
++        for bit in ("lt", "gt", "eq", "so")
++    ]
+     all_regs = (
+         saved_regs
+         + temp_regs
+@@ -811,8 +822,7 @@ class PpcArch(Arch):
+             for r in [
+                 # `zero` isn't a "real" PPC register; it's a normalized form of `r0`
+                 "zero",
+-                # TODO: These `crX` registers are only used to parse instructions, but
+-                # the instructions that use these registers aren't implemented yet.
++                # Whole fields are operands; their individual bits carry comparisons.
+                 "cr0",
+                 "cr1",
+                 "cr2",
+@@ -901,6 +911,19 @@ class PpcArch(Arch):
+                 instr = replace(instr, mnemonic=b + instr.mnemonic[3:])
+ 
+         args = instr.args
++        if instr.mnemonic in {
++            "cror", "crorc", "crand", "crandc", "crxor", "crnand", "crnor",
++            "creqv", "crnot", "crmove", "crclr", "crset",
++        }:
++            # DTK/GAS can spell CR0 bits symbolically instead of as bit indices.
++            bits = {"lt": 0, "gt": 1, "eq": 2, "so": 3, "un": 3}
++            args = [
++                AsmLiteral(bits[arg.symbol_name])
++                if isinstance(arg, AsmGlobalSymbol) and arg.symbol_name in bits
++                else arg
++                for arg in args
++            ]
++            instr = replace(instr, args=args)
+         base_mnemonic = instr.mnemonic.rstrip(".")
+         dot = instr.mnemonic[len(base_mnemonic) :]
+ 
+@@ -1085,9 +1108,11 @@ class PpcArch(Arch):
+             "bsolr",
+         ):
+             # Conditional return
+-            # TODO: Support crN argument
+             assert len(args) <= 1
+-            inputs = cr0_bits + [Register("lr")]
++            field = args[0] if args else Register("cr0")
++            assert isinstance(field, Register) and field.register_name in {f"cr{i}" for i in range(8)}
++            inputs = [Register(f"{field.register_name}_{bit}") for bit in ("lt", "gt", "eq", "so")]
++            inputs.append(Register("lr"))
+             is_return = True
+             is_conditional = True
+             # NB: These are rewritten to mnemonic[:-2] by build_blocks in flow_graph.py
+@@ -1123,12 +1148,15 @@ class PpcArch(Arch):
+             jump_target = get_jump_target(args[0])
+         elif mnemonic in cls.instrs_branches:
+             # Normal branch
+-            # TODO: Support crN argument
+             assert 1 <= len(args) <= 2
+             # If the name starts with "!", negate the condition
+             raw_name = cls.instrs_branches[mnemonic]
+             negated = raw_name.startswith("!")
+             reg_name = raw_name.lstrip("!")
++            if len(args) == 2 and reg_name.startswith("cr0_"):
++                field = args[0]
++                assert isinstance(field, Register) and field.register_name in {f"cr{i}" for i in range(8)}
++                reg_name = field.register_name + reg_name[3:]
+ 
+             inputs = [Register(reg_name)]
+             jump_target = get_jump_target(args[-1])
+@@ -1436,19 +1464,16 @@ class PpcArch(Arch):
+         elif mnemonic in cls.instrs_ppc_compare:
+             assert len(args) == 3 and isinstance(args[1], Register)
+             inputs = [r for r in args[1:] if isinstance(r, Register)]
+-            outputs = list(cr0_bits)
++            field = args[0]
++            assert isinstance(field, Register) and field.register_name in {f"cr{i}" for i in range(8)}
++            prefix = field.register_name
++            outputs = [Register(f"{prefix}_{bit}") for bit in ("lt", "gt", "eq", "so")]
+ 
+             def eval_fn(s: NodeState, a: InstrArgs) -> None:
+-                base_reg = a.reg_ref(0)
+-                if base_reg != Register("cr0"):
+-                    error = f'"{instr_str}" is not supported, the first arg is not $cr0'
+-                    s.write_statement(error_stmt(error))
+-                    return
+-
+-                s.set_reg(Register("cr0_eq"), cls.instrs_ppc_compare[mnemonic](a, "=="))
+-                s.set_reg(Register("cr0_gt"), cls.instrs_ppc_compare[mnemonic](a, ">"))
+-                s.set_reg(Register("cr0_lt"), cls.instrs_ppc_compare[mnemonic](a, "<"))
+-                s.set_reg(Register("cr0_so"), Literal(0))
++                s.set_reg(Register(f"{prefix}_eq"), cls.instrs_ppc_compare[mnemonic](a, "=="))
++                s.set_reg(Register(f"{prefix}_gt"), cls.instrs_ppc_compare[mnemonic](a, ">"))
++                s.set_reg(Register(f"{prefix}_lt"), cls.instrs_ppc_compare[mnemonic](a, "<"))
++                s.set_reg(Register(f"{prefix}_so"), Literal(0))
+ 
+         elif mnemonic in cls.instrs_ignore:
+             pass
+diff --git a/m2c/flow_graph.py b/m2c/flow_graph.py
+index a094393..25c95ba 100644
+--- a/m2c/flow_graph.py
++++ b/m2c/flow_graph.py
+@@ -658,7 +658,7 @@ def build_blocks(
+             assert item.mnemonic[-2:] == "lr"
+             branch_instr = arch.parse(
+                 item.mnemonic[:-2],
+-                [AsmGlobalSymbol(cond_return_target)],
++                [*item.args, AsmGlobalSymbol(cond_return_target)],
+                 item.meta.derived(),
+             )
+             block_builder.add_instruction(branch_instr)
+diff --git a/tests/end_to_end/ppc-cr-field-branch/context.c b/tests/end_to_end/ppc-cr-field-branch/context.c
+new file mode 100644
+index 0000000..cb9ec69
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-branch/context.c
+@@ -0,0 +1 @@
++int test(int first, int second);
+diff --git a/tests/end_to_end/ppc-cr-field-branch/manual-flags.txt b/tests/end_to_end/ppc-cr-field-branch/manual-flags.txt
+new file mode 100644
+index 0000000..06b26e4
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-branch/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --globals=none
+diff --git a/tests/end_to_end/ppc-cr-field-branch/manual-out.c b/tests/end_to_end/ppc-cr-field-branch/manual-out.c
+new file mode 100644
+index 0000000..e941fed
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-branch/manual-out.c
+@@ -0,0 +1,6 @@
++s32 test(s32 first, s32 second) {
++    if (first != 0) {
++        return 7;
++    }
++    return 9;
++}
+diff --git a/tests/end_to_end/ppc-cr-field-branch/manual.s b/tests/end_to_end/ppc-cr-field-branch/manual.s
+new file mode 100644
+index 0000000..0248ecf
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-branch/manual.s
+@@ -0,0 +1,10 @@
++.global test
++test:
++cmpwi cr1, r3, 0
++cmpwi cr0, r4, 0
++beq cr1, .L_zero
++li r3, 7
++blr
++.L_zero:
++li r3, 9
++blr
+diff --git a/tests/end_to_end/ppc-cr-field-return/context.c b/tests/end_to_end/ppc-cr-field-return/context.c
+new file mode 100644
+index 0000000..cb9ec69
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-return/context.c
+@@ -0,0 +1 @@
++int test(int first, int second);
+diff --git a/tests/end_to_end/ppc-cr-field-return/manual-flags.txt b/tests/end_to_end/ppc-cr-field-return/manual-flags.txt
+new file mode 100644
+index 0000000..06b26e4
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-return/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --globals=none
+diff --git a/tests/end_to_end/ppc-cr-field-return/manual-out.c b/tests/end_to_end/ppc-cr-field-return/manual-out.c
+new file mode 100644
+index 0000000..5d7d544
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-return/manual-out.c
+@@ -0,0 +1,6 @@
++s32 test(s32 first, s32 second) {
++    if (first != 0) {
++        return 7;
++    }
++    return first;
++}
+diff --git a/tests/end_to_end/ppc-cr-field-return/manual.s b/tests/end_to_end/ppc-cr-field-return/manual.s
+new file mode 100644
+index 0000000..36dcf3e
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-field-return/manual.s
+@@ -0,0 +1,7 @@
++.global test
++test:
++cmpwi cr1, r3, 0
++cmpwi cr0, r4, 0
++beqlr cr1
++li r3, 7
++blr
+diff --git a/tests/end_to_end/ppc-symbolic-cr-bits/context.c b/tests/end_to_end/ppc-symbolic-cr-bits/context.c
+new file mode 100644
+index 0000000..0b06e8b
+--- /dev/null
++++ b/tests/end_to_end/ppc-symbolic-cr-bits/context.c
+@@ -0,0 +1 @@
++int test(float first, float second);
+diff --git a/tests/end_to_end/ppc-symbolic-cr-bits/manual-flags.txt b/tests/end_to_end/ppc-symbolic-cr-bits/manual-flags.txt
+new file mode 100644
+index 0000000..06b26e4
+--- /dev/null
++++ b/tests/end_to_end/ppc-symbolic-cr-bits/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --globals=none
+diff --git a/tests/end_to_end/ppc-symbolic-cr-bits/manual-out.c b/tests/end_to_end/ppc-symbolic-cr-bits/manual-out.c
+new file mode 100644
+index 0000000..4560558
+--- /dev/null
++++ b/tests/end_to_end/ppc-symbolic-cr-bits/manual-out.c
+@@ -0,0 +1,6 @@
++s32 test(f32 first, f32 second) {
++    if (first <= second) {
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-symbolic-cr-bits/manual.s b/tests/end_to_end/ppc-symbolic-cr-bits/manual.s
+new file mode 100644
+index 0000000..5aaa0cf
+--- /dev/null
++++ b/tests/end_to_end/ppc-symbolic-cr-bits/manual.s
+@@ -0,0 +1,10 @@
++.global test
++test:
++fcmpo cr0, f1, f2
++cror eq, lt, eq
++bne .L_false
++li r3, 1
++blr
++.L_false:
++li r3, 0
++blr
+diff --git a/tests/unit/test_ppc.py b/tests/unit/test_ppc.py
+new file mode 100644
+index 0000000..dfe5fd3
+--- /dev/null
++++ b/tests/unit/test_ppc.py
+@@ -0,0 +1,38 @@
++import unittest
++
++from m2c.arch_ppc import PpcArch
++from m2c.asm_instruction import AsmGlobalSymbol, AsmInstruction, AsmLiteral, AsmState, Register
++from m2c.instruction import InstructionMeta
++
++
++class TestPpcConditionFields(unittest.TestCase):
++    def test_symbolic_cr_bits_normalize_like_numeric_bits(self):
++        symbolic = AsmInstruction("cror", [AsmGlobalSymbol("eq"), AsmGlobalSymbol("lt"), AsmGlobalSymbol("eq")])
++        normalized = PpcArch.normalize_instruction(symbolic, AsmState())
++        self.assertEqual(normalized.args, [AsmLiteral(2), AsmLiteral(0), AsmLiteral(2)])
++        other = AsmInstruction("addi", [Register("r3"), Register("r4"), AsmGlobalSymbol("eq")])
++        self.assertEqual(PpcArch.normalize_instruction(other, AsmState()).args[-1], AsmGlobalSymbol("eq"))
++
++    def test_branch_reads_requested_field(self):
++        branch = PpcArch.parse("beq", [Register("cr1"), AsmGlobalSymbol("label")], InstructionMeta.missing())
++        self.assertEqual(branch.inputs, [Register("cr1_eq")])
++        default = PpcArch.parse("bne", [AsmGlobalSymbol("label")], InstructionMeta.missing())
++        self.assertEqual(default.inputs, [Register("cr0_eq")])
++
++    def test_compare_writes_only_requested_field(self):
++        compare = PpcArch.parse("cmpwi", [Register("cr3"), Register("r3"), AsmLiteral(0)], InstructionMeta.missing())
++        self.assertEqual(set(compare.outputs), {Register(f"cr3_{bit}") for bit in ("lt", "gt", "eq", "so")})
++
++    def test_conditional_return_reads_requested_field(self):
++        branch = PpcArch.parse("beqlr", [Register("cr2")], InstructionMeta.missing())
++        self.assertIn(Register("cr2_eq"), branch.inputs)
++        self.assertNotIn(Register("cr0_eq"), branch.inputs)
++
++    def test_condition_fields_obey_call_preservation(self):
++        self.assertIn(Register("cr1_eq"), PpcArch.temp_regs)
++        self.assertIn(Register("cr2_eq"), PpcArch.saved_regs)
++        self.assertNotIn(Register("cr2_eq"), PpcArch.temp_regs)
++
++
++if __name__ == "__main__":
++    unittest.main()

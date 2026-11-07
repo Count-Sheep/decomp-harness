@@ -1,0 +1,130 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+index b7f9dca..20cb4e0 100644
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -100,6 +100,15 @@ from .flow_graph import ArchFlowGraph, FlowGraph, InstrRef, RefSet
+ from .types import FunctionSignature, Type
+ 
+ 
++def negative_fused_subtract(args: InstrArgs, single: bool = False) -> Expression:
++    op = BinaryOp.f32 if single else BinaryOp.f64
++    product = op(args.reg(1), "*", args.reg(2))
++    info = args.stack_info.global_info
++    if info.mwcc_fused_subtract and info.target.compiler == Target.CompilerEnum.MWCC:
++        return op(args.reg(3), "-", product)
++    return UnaryOp("-", op(product, "-", args.reg(3)), type=Type.f32() if single else Type.f64())
++
++
+ def store_quantized(args: InstrArgs) -> None:
+     target = args.memory_ref(1)
+     source = args.regs.get_raw(args.reg_ref(0))
+@@ -2029,16 +2038,8 @@ class PpcArch(Arch):
+         "fmsubs": lambda a: BinaryOp.f32(
+             BinaryOp.f32(a.reg(1), "*", a.reg(2)), "-", a.reg(3)
+         ),
+-        "fnmsub": lambda a: UnaryOp(
+-            "-",
+-            BinaryOp.f64(BinaryOp.f64(a.reg(1), "*", a.reg(2)), "-", a.reg(3)),
+-            type=Type.f64(),
+-        ),
+-        "fnmsubs": lambda a: UnaryOp(
+-            "-",
+-            BinaryOp.f32(BinaryOp.f32(a.reg(1), "*", a.reg(2)), "-", a.reg(3)),
+-            type=Type.f32(),
+-        ),
++        "fnmsub": lambda a: negative_fused_subtract(a),
++        "fnmsubs": lambda a: negative_fused_subtract(a, single=True),
+         # TODO: Detect if we should use fabs or fabsf
+         "fabs": lambda a: fn_op("fabs", [a.reg(1)], Type.floatish()),
+         "fres": lambda a: fn_op("__fres", [a.reg(1)], Type.floatish()),
+diff --git a/m2c/main.py b/m2c/main.py
+index 326763b..6090fc2 100644
+--- a/m2c/main.py
++++ b/m2c/main.py
+@@ -216,6 +216,7 @@ def run(options: Options) -> int:
+         typepool,
+         deterministic_vars=options.deterministic_vars,
+         stack_spill_detection=options.stack_spill_detection,
++        mwcc_fused_subtract=options.mwcc_fused_subtract,
+     )
+ 
+     decompilations: List[DecompilationState] = []
+@@ -599,6 +600,11 @@ def parse_flags(flags: List[str]) -> Options:
+         help="Name temp and phi vars after their location in the source asm, "
+         "rather than using an incrementing suffix. Can help reduce diff size in tests.",
+     )
++    group.add_argument(
++        "--mwcc-fused-subtract", action="store_true",
++        help="Matching variant: emit negative fused subtraction as c-a*b. "
++        "Requires MWCC codegen verification; not a general IEEE-equivalent rewrite.",
++    )
+     group.add_argument(
+         "--descending-regs",
+         dest="descending_regs",
+@@ -824,6 +830,7 @@ def parse_flags(flags: List[str]) -> Options:
+         passes=args.passes,
+         incbin_dirs=args.incbin_dirs,
+         deterministic_vars=args.deterministic_vars,
++        mwcc_fused_subtract=args.mwcc_fused_subtract,
+         descending_regs=args.descending_regs,
+         backwards_bss=args.backwards_bss,
+         disable_gc=args.disable_gc,
+diff --git a/m2c/options.py b/m2c/options.py
+index a64e134..267d8a6 100644
+--- a/m2c/options.py
++++ b/m2c/options.py
+@@ -200,6 +200,7 @@ class Options:
+     disable_gc: bool
+     union_field_overrides: Dict[str, str]
+     explicit_field_access: bool = False
++    mwcc_fused_subtract: bool = False
+ 
+     def formatter(self) -> Formatter:
+         return Formatter(
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 57c1bd9..bc36541 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -4431,6 +4431,7 @@ class GlobalInfo:
+     typepool: TypePool
+     deterministic_vars: bool
+     stack_spill_detection: bool
++    mwcc_fused_subtract: bool = False
+     global_symbol_map: Dict[str, GlobalSymbol] = field(default_factory=dict)
+     persistent_function_state: Dict[str, PersistentFunctionState] = field(
+         default_factory=lambda: defaultdict(PersistentFunctionState)
+diff --git a/tests/unit/test_fused_subtract_variant.py b/tests/unit/test_fused_subtract_variant.py
+new file mode 100644
+index 0000000..020dc01
+--- /dev/null
++++ b/tests/unit/test_fused_subtract_variant.py
+@@ -0,0 +1,29 @@
++from pathlib import Path
++import tempfile
++import unittest
++
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestFusedSubtractVariant(unittest.TestCase):
++    def translate(self, opcode, variant, scalar="double"):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            source, context = root / "target.s", root / "context.c"
++            source.write_text(f".fn test, global\n{opcode} f1,f1,f2,f3\nblr\n.endfn test\n")
++            context.write_text(f"{scalar} test({scalar} a, {scalar} b, {scalar} c);")
++            flags = ["-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache", "--context", str(context), str(source)]
++            if variant:
++                flags.append("--mwcc-fused-subtract")
++            return decompile_and_capture_output(parse_flags(flags))
++
++    def test_default_retains_outer_negation(self):
++        self.assertIn("return -((a * b) - c);", self.translate("fnmsub", False))
++
++    def test_variant_changes_only_negative_subtraction(self):
++        for opcode, scalar in (("fnmsub", "double"), ("fnmsubs", "float")):
++            with self.subTest(opcode=opcode):
++                self.assertIn("return c - (a * b);", self.translate(opcode, True, scalar))
++        for opcode in ("fmadd", "fmsub", "fnmadd"):
++            self.assertEqual(self.translate(opcode, False), self.translate(opcode, True))

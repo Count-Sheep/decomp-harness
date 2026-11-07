@@ -1,0 +1,191 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 05549db..5b76e17 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1434,6 +1434,13 @@ class Cast(Expression):
+             if fmt.valid_syntax:
+                 return f"M2C_BITWISE({self.type.format(fmt)}, {self.expr.format(fmt)})"
+             return f"(bitwise {self.type.format(fmt)}) {self.expr.format(fmt)}"
++        if fmt.valid_syntax and self.reinterpret and (
++            (self.type.is_pointer() and self.expr.type.is_int())
++            or (self.type.is_int() and self.expr.type.is_pointer_or_array())
++        ):
++            # Register-bit reinterpretation is free, but C still requires this
++            # conversion even when the IR marked the cast as silent.
++            return f"({self.type.format(fmt)}) {self.expr.format(fmt)}"
+         if self.reinterpret and (
+             self.silent
+             or (is_type_obvious(self.expr) and self.expr.type.unify(self.type))
+@@ -4765,6 +4772,16 @@ class GlobalInfo:
+                 qualifier = f"{qualifier} " if qualifier else ""
+                 value = f" = {value}" if value else ""
+                 declaration = sym.type.to_decl(name, fmt)
++                signature = sym.type.data().fn_sig
++                if (fmt.valid_syntax and not sym.type_provided and signature is not None
++                        and signature.return_type.is_unconstrained()):
++                    # No return-register use constrained this unknown callee.
++                    # Keep inference intact; only its emitted prototype is void.
++                    ctype = sym.type._to_ctype(set(), fmt)
++                    if isinstance(ctype, ca.FuncDecl):
++                        ctype.type = Type.void()._to_ctype(set(), fmt)
++                        declaration = type_to_string(ctype, name)
++                        comments.append("return value unused")
+                 if decls == Options.GlobalDeclsEnum.USED_CONTEXT and not is_in_file and sym.type_provided:
+                     # Keep qualifiers and authoritative prototypes from context.
+                     # Only unspecified parameter lists use inferred ABI evidence.
+diff --git a/m2c/types.py b/m2c/types.py
+index a2a1a37..7d0f19c 100644
+--- a/m2c/types.py
++++ b/m2c/types.py
+@@ -303,6 +303,10 @@ class Type:
+     def is_float(self) -> bool:
+         return self.data().kind == TypeData.K_FLOAT
+ 
++    def is_unconstrained(self) -> bool:
++        data = self.data()
++        return data.kind == data.likely_kind == TypeData.K_ANY and data.size_bits is None
++
+     def is_likely_float(self) -> bool:
+         data = self.data()
+         return data.kind == TypeData.K_FLOAT or data.likely_kind == TypeData.K_FLOAT
+@@ -736,7 +740,10 @@ class Type:
+ 
+         if data.kind == TypeData.K_PTR:
+             target_ctype: CType
+-            if data.ptr_to is None:
++            if data.ptr_to is None or (
++                fmt.valid_syntax
++                and data.ptr_to.is_unconstrained()
++            ):
+                 target_ctype = simple_ctype("void")
+             else:
+                 target_ctype = data.ptr_to._to_ctype(seen.copy(), fmt)
+diff --git a/tests/end_to_end/global_decls/agbcc-o2-out.c b/tests/end_to_end/global_decls/agbcc-o2-out.c
+index 9749550..0b04fee 100644
+--- a/tests/end_to_end/global_decls/agbcc-o2-out.c
++++ b/tests/end_to_end/global_decls/agbcc-o2-out.c
+@@ -3,8 +3,8 @@ struct _m2c_stack_test {
+ };                                                  /* size = 0xC */
+ 
+ s32 __mulsf3(s32, s32);                             /* extern */
+-M2C_UNK extern_fn(struct A *);                      /* extern */
+-M2C_UNK static_fn(struct A *);                      /* static */
++void extern_fn(struct A *);                         /* extern; return value unused */
++void static_fn(struct A *);                         /* static; return value unused */
+ extern s32 extern_float;
+ 
+ s32 test(void) {
+diff --git a/tests/end_to_end/global_decls/irix-o2-allglobals-out.c b/tests/end_to_end/global_decls/irix-o2-allglobals-out.c
+index 870bf2e..1b461dc 100644
+--- a/tests/end_to_end/global_decls/irix-o2-allglobals-out.c
++++ b/tests/end_to_end/global_decls/irix-o2-allglobals-out.c
+@@ -2,8 +2,8 @@ struct _m2c_stack_test {
+     /* 0x00 */ char pad0[0x18];
+ };                                                  /* size = 0x18 */
+ 
+-M2C_UNK extern_fn(struct A *);                      /* extern */
+-M2C_UNK static_fn(struct A *);                      /* static */
++void extern_fn(struct A *);                         /* extern; return value unused */
++void static_fn(struct A *);                         /* static; return value unused */
+ extern f32 extern_float;
+ struct A static_A = {
+     1,
+diff --git a/tests/end_to_end/global_decls/irix-o2-out.c b/tests/end_to_end/global_decls/irix-o2-out.c
+index 0f4c0b2..b5c54cf 100644
+--- a/tests/end_to_end/global_decls/irix-o2-out.c
++++ b/tests/end_to_end/global_decls/irix-o2-out.c
+@@ -2,8 +2,8 @@ struct _m2c_stack_test {
+     /* 0x00 */ char pad0[0x18];
+ };                                                  /* size = 0x18 */
+ 
+-M2C_UNK extern_fn(struct A *);                      /* extern */
+-M2C_UNK static_fn(struct A *);                      /* static */
++void extern_fn(struct A *);                         /* extern; return value unused */
++void static_fn(struct A *);                         /* static; return value unused */
+ extern f32 extern_float;
+ s32 static_int;
+ s32 static_bss_array[3];
+diff --git a/tests/end_to_end/misc1/irix-o2-validsyntax-out.c b/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
+index 1e92162..ad70a25 100644
+--- a/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
++++ b/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
+@@ -1,5 +1,5 @@
+ s32 func_00400140(M2C_UNK, M2C_UNK, s32, M2C_UNK, s32);
+-M2C_UNK func_00400158(s32, s32, s32);
++void func_00400158(s32, s32, s32);
+ extern s32 D_410170;
+ extern M2C_UNK D_410178;
+ 
+diff --git a/tests/unit/test_unknown_pointer_decls.py b/tests/unit/test_unknown_pointer_decls.py
+new file mode 100644
+index 0000000..3f315da
+--- /dev/null
++++ b/tests/unit/test_unknown_pointer_decls.py
+@@ -0,0 +1,67 @@
++import unittest
++
++from m2c.options import Formatter
++from m2c.types import Type, TypeData
++from m2c.translate import Cast, GlobalSymbol
++from tests.unit import test_native_drafts
++
++
++class TestUnknownPointerDecls(unittest.TestCase):
++    def test_unsized_unknown_pointee_is_void_without_changing_inference(self):
++        target = Type.any()
++        pointer = Type.ptr(target)
++        self.assertEqual(pointer.format(Formatter(valid_syntax=True)), "void *")
++        self.assertTrue(target.is_unconstrained())
++        self.assertEqual(pointer.format(Formatter()), "? *")
++
++    def test_width_and_float_evidence_are_preserved(self):
++        for target, expected in ((Type.f32(), "f32 *"), (Type.s32(), "s32 *"),
++                                 (Type(TypeData(size_bits=32)), "M2C_UNK32 *")):
++            self.assertEqual(Type.ptr(target).format(Formatter(valid_syntax=True)), expected)
++        likely_float = Type(TypeData(likely_kind=TypeData.K_FLOAT))
++        self.assertFalse(likely_float.is_unconstrained())
++        self.assertEqual(Type.ptr(likely_float).format(Formatter(valid_syntax=True)), "f32 *")
++
++    def test_unknown_values_are_not_replaced_with_void(self):
++        self.assertEqual(Type.any().format(Formatter(valid_syntax=True)), "M2C_UNK")
++
++    def test_silent_register_casts_keep_required_integer_pointer_conversions(self):
++        pointer = Type.ptr(Type.s32())
++        to_pointer = Cast(GlobalSymbol("address", Type.s32()), pointer, reinterpret=True, silent=True)
++        self.assertEqual(to_pointer.format(Formatter(valid_syntax=True)), "(s32 *) address")
++        self.assertEqual(to_pointer.format(Formatter()), "address")
++        to_integer = Cast(GlobalSymbol("address", pointer), Type.s32(), reinterpret=True, silent=True)
++        self.assertEqual(to_integer.format(Formatter(valid_syntax=True)), "(s32) address")
++        self.assertEqual(to_integer.format(Formatter()), "address")
++
++    def test_context_integer_return_used_as_memory_address_has_explicit_cast(self):
++        code = test_native_drafts.TestNativeDrafts().translate(
++            "stwu r1,-16(r1)\nmflr r0\nstw r0,20(r1)\nbl lookup\n"
++            "cmplwi r3,0\nbeq .Lzero\nlbz r0,1(r3)\ncmplwi r0,0\nbeq .Lload\n"
++            ".Lzero:\nli r3,0\nb .Ldone\n.Lload:\nlwz r3,4(r3)\n.Ldone:\n"
++            "lwz r0,20(r1)\nmtlr r0\naddi r1,r1,16\nblr",
++            "int test(void); int lookup();")
++        self.assertIn("int lookup(", code)
++        self.assertIn("(void *) lookup(", code)
++
++    def test_unused_callee_return_can_be_declared_void(self):
++        code = test_native_drafts.TestNativeDrafts().translate(
++            "stwu r1,-16(r1)\nmflr r0\nstw r0,20(r1)\nbl notify\n"
++            "lwz r0,20(r1)\nmtlr r0\naddi r1,r1,16\nblr", "void test(void);")
++        self.assertIn("void notify(", code)
++        self.assertIn("return value unused", code)
++        self.assertNotIn("M2C_UNK", code)
++
++    def test_used_and_authoritative_callee_returns_are_preserved(self):
++        code = test_native_drafts.TestNativeDrafts().translate("b lookup", "int test(void);")
++        self.assertIn("s32 lookup(", code)
++        self.assertNotIn("void lookup(", code)
++        code = test_native_drafts.TestNativeDrafts().translate(
++            "stwu r1,-16(r1)\nmflr r0\nstw r0,20(r1)\nbl notify\n"
++            "lwz r0,20(r1)\nmtlr r0\naddi r1,r1,16\nblr",
++            "void test(void); double notify(void);")
++        self.assertIn("double notify(void);", code)
++
++
++if __name__ == "__main__":
++    unittest.main()

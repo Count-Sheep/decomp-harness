@@ -1,0 +1,297 @@
+diff --git a/m2c/main.py b/m2c/main.py
+index ea51ce1..326763b 100644
+--- a/m2c/main.py
++++ b/m2c/main.py
+@@ -431,6 +431,7 @@ def parse_flags(flags: List[str]) -> Options:
+         help="Control which global declarations & initializers are emitted. "
+         '"all" includes all globals with entries in .data/.rodata/.bss, as well as inferred symbols. '
+         '"used" only includes symbols used by the decompiled functions that are not in the context (default). '
++        '"used-context" also declares referenced external symbols supplied by the context, using inferred call parameters when unspecified. '
+         '"none" does not emit any global declarations. ',
+     )
+     group.add_argument(
+diff --git a/m2c/options.py b/m2c/options.py
+index 35a8a6e..a64e134 100644
+--- a/m2c/options.py
++++ b/m2c/options.py
+@@ -149,6 +149,7 @@ class Options:
+     class GlobalDeclsEnum(ChoicesEnum):
+         ALL = "all"
+         USED = "used"
++        USED_CONTEXT = "used-context"
+         NONE = "none"
+ 
+     class VisualizeTypeEnum(ChoicesEnum):
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 7c88403..05549db 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -23,7 +23,9 @@ from typing import (
+     Union,
+ )
+ 
+-from .c_types import ArchC, CType, TypeMap, is_unk_type
++from m2c_pycparser import c_ast as ca
++
++from .c_types import ArchC, CType, TypeMap, is_unk_type, type_to_string
+ from .demangle_codewarrior import parse as demangle_codewarrior_parse, CxxSymbol
+ from .error import DecompFailure, assert_never
+ from .flow_graph import (
+@@ -1301,7 +1303,13 @@ class BinaryOp(Condition):
+         if self.op in PSEUDO_FUNCTION_OPS:
+             return f"{self.op}({lhs}, {rhs})"
+ 
+-        return f"({lhs} {self.op} {rhs})"
++        result = f"({lhs} {self.op} {rhs})"
++        if (fmt.valid_syntax and self.op in ("+", "-") and self.type.is_pointer()
++                and not left_expr.type.is_pointer_or_array()
++                and not right_expr.type.is_pointer_or_array()):
++            # Pointer inference on the result does not change the C operand types.
++            return f"(({self.type.format(fmt)}) {result})"
++        return result
+ 
+ 
+ @dataclass(frozen=True, eq=False)
+@@ -1661,6 +1669,15 @@ class StructAccess(Expression):
+ 
+         field_path: Optional[AccessPath] = self.late_field_path()
+ 
++        if fmt.valid_syntax and fmt.explicit_field_access and field_path is None:
++            # Even at offset zero the address may be an integer-valued register
++            # expression. Preserve the load/store type instead of emitting *int.
++            pointer = Type.ptr(self.type).format(fmt)
++            if self.offset == 0:
++                return f"(*({pointer})({var.format(fmt)}))"
++            offset_str = fmt.format_int(self.offset)
++            return f"(*({pointer})((char *)({var.format(fmt)}) + ({offset_str})))"
++
+         if field_path is not None and field_path != [0]:
+             has_nonzero_access = True
+         elif fmt.valid_syntax and (self.offset != 0 or has_nonzero_access):
+@@ -3949,6 +3966,13 @@ class NodeState:
+             # match the actual function signature, but it's the best we can do.
+             # Without that assumption, the logic from `function_abi` would be needed here.
+             for i, (arg_expr, param) in enumerate(zip(func_args, fn_sig.params)):
++                if arch.arch == Target.ArchEnum.PPC:
++                    slots = abi.arg_slots + abi.possible_slots
++                    if i < len(slots):
++                        # A constant in a GPR is not an unknown float-or-integer
++                        # argument. Keep the ABI's register-class evidence even
++                        # when literal cloning discards its inferred type.
++                        param.type.unify(slots[i].type)
+                 func_args[i] = as_type(arg_expr, param.type.decay(), True)
+ 
+         # Reset subroutine_args, for the next potential function call.
+@@ -4615,7 +4639,8 @@ class GlobalInfo:
+                 if self.local_functions == {name}:
+                     # Skip the function being decompiled if just a single one
+                     continue
+-                if not is_in_file and sym.type_provided:
++                if (not is_in_file and sym.type_provided
++                        and decls != Options.GlobalDeclsEnum.USED_CONTEXT):
+                     # Skip externally-declared symbols that are defined in other files
+                     continue
+ 
+@@ -4717,7 +4742,8 @@ class GlobalInfo:
+                 if decls == Options.GlobalDeclsEnum.NONE:
+                     continue
+                 # In modes except "all", skip the decl if the context file already had an initializer
+-                if decls != Options.GlobalDeclsEnum.ALL and sym.initializer_in_typemap:
++                if (decls != Options.GlobalDeclsEnum.ALL and sym.initializer_in_typemap
++                        and not (decls == Options.GlobalDeclsEnum.USED_CONTEXT and not is_in_file)):
+                     continue
+                 # In modes except "all", skip vtable decls when compiling C++
+                 if (
+@@ -4738,11 +4764,25 @@ class GlobalInfo:
+ 
+                 qualifier = f"{qualifier} " if qualifier else ""
+                 value = f" = {value}" if value else ""
++                declaration = sym.type.to_decl(name, fmt)
++                if decls == Options.GlobalDeclsEnum.USED_CONTEXT and not is_in_file and sym.type_provided:
++                    # Keep qualifiers and authoritative prototypes from context.
++                    # Only unspecified parameter lists use inferred ABI evidence.
++                    fn = self.typemap.functions.get(sym.c_symbol_name)
++                    if fn is not None:
++                        ctype = fn.type
++                        if fn.params is None:
++                            inferred = sym.type._to_ctype(set(), fmt)
++                            if isinstance(inferred, ca.FuncDecl):
++                                ctype = ca.FuncDecl(type=fn.ret_type, args=inferred.args)
++                        declaration = type_to_string(ctype, name)
++                    elif sym.c_symbol_name in self.typemap.var_types:
++                        declaration = type_to_string(self.typemap.var_types[sym.c_symbol_name], name)
+                 lines.append(
+                     (
+                         sort_order,
+                         fmt.with_comments(
+-                            f"{qualifier}{sym.type.to_decl(name, fmt)}{value};",
++                            f"{qualifier}{declaration}{value};",
+                             comments,
+                         )
+                         + "\n",
+diff --git a/tests/end_to_end/custom-return/mwcc-o4p-out.c b/tests/end_to_end/custom-return/mwcc-o4p-out.c
+index 4a965e5..860acdd 100644
+--- a/tests/end_to_end/custom-return/mwcc-o4p-out.c
++++ b/tests/end_to_end/custom-return/mwcc-o4p-out.c
+@@ -1,4 +1,4 @@
+-u16 foo(?);                                         /* static */
++u16 foo(s32);                                       /* static */
+ extern s32 glob;
+ 
+ u16 test(void) {
+diff --git a/tests/end_to_end/misc1/irix-o2-validsyntax-out.c b/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
+index 9320db9..1e92162 100644
+--- a/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
++++ b/tests/end_to_end/misc1/irix-o2-validsyntax-out.c
+@@ -11,7 +11,7 @@ s32 test(s32 arg0, M2C_UNK arg1) {
+     s32 temp_v0_2;
+     void *temp_v0;
+ 
+-    temp_v0 = D_410170 + (arg0 * 8);
++    temp_v0 = (void *) (D_410170 + (arg0 * 8));
+     temp_a2 = M2C_FIELD(temp_v0, s32 *, 4) + 1;
+     sp2C = temp_a2;
+     sp24 = M2C_FIELD(temp_v0, s32 *, 8);
+diff --git a/tests/end_to_end/misc1/mwcc-o4p-out.c b/tests/end_to_end/misc1/mwcc-o4p-out.c
+index 801fd2a..13f3ca6 100644
+--- a/tests/end_to_end/misc1/mwcc-o4p-out.c
++++ b/tests/end_to_end/misc1/mwcc-o4p-out.c
+@@ -1,5 +1,5 @@
+ ? bar(s32, s32, s32);                               /* static */
+-s32 foo(?, ?, s32, s32, s32);                       /* static */
++s32 foo(s32, s32, s32, s32, s32);                   /* static */
+ extern s32 global;
+ static ? global2;
+ 
+diff --git a/tests/end_to_end/nested_ifs/mwcc-o4p-out.c b/tests/end_to_end/nested_ifs/mwcc-o4p-out.c
+index 2034adb..d537238 100644
+--- a/tests/end_to_end/nested_ifs/mwcc-o4p-out.c
++++ b/tests/end_to_end/nested_ifs/mwcc-o4p-out.c
+@@ -1,4 +1,4 @@
+-? foo(?);                                           /* static */
++? foo(s32);                                         /* static */
+ 
+ void test(s32 arg0) {
+     if (arg0 == 7) {
+diff --git a/tests/end_to_end/nested_ifs2/mwcc-o4p-out.c b/tests/end_to_end/nested_ifs2/mwcc-o4p-out.c
+index 84457ea..32c976e 100644
+--- a/tests/end_to_end/nested_ifs2/mwcc-o4p-out.c
++++ b/tests/end_to_end/nested_ifs2/mwcc-o4p-out.c
+@@ -1,4 +1,4 @@
+-? foo(?);                                           /* static */
++? foo(s32);                                         /* static */
+ 
+ void test(s32 arg0) {
+     if (arg0 == 7) {
+diff --git a/tests/end_to_end/nested_ifs3/mwcc-o4p-out.c b/tests/end_to_end/nested_ifs3/mwcc-o4p-out.c
+index d1dfe45..33ec0ad 100644
+--- a/tests/end_to_end/nested_ifs3/mwcc-o4p-out.c
++++ b/tests/end_to_end/nested_ifs3/mwcc-o4p-out.c
+@@ -1,4 +1,4 @@
+-? foo(?);                                           /* static */
++? foo(s32);                                         /* static */
+ 
+ void test(s32 arg0) {
+     if (arg0 == 7) {
+diff --git a/tests/end_to_end/nested_ifs4/mwcc-o4p-out.c b/tests/end_to_end/nested_ifs4/mwcc-o4p-out.c
+index d1dfe45..33ec0ad 100644
+--- a/tests/end_to_end/nested_ifs4/mwcc-o4p-out.c
++++ b/tests/end_to_end/nested_ifs4/mwcc-o4p-out.c
+@@ -1,4 +1,4 @@
+-? foo(?);                                           /* static */
++? foo(s32);                                         /* static */
+ 
+ void test(s32 arg0) {
+     if (arg0 == 7) {
+diff --git a/tests/unit/test_native_drafts.py b/tests/unit/test_native_drafts.py
+new file mode 100644
+index 0000000..f8bc448
+--- /dev/null
++++ b/tests/unit/test_native_drafts.py
+@@ -0,0 +1,86 @@
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestNativeDrafts(unittest.TestCase):
++    def translate(self, instructions, context, declarations="used-context"):
++        with tempfile.TemporaryDirectory() as name:
++            root = Path(name)
++            (root / "target.s").write_text(".fn test, global\n" + instructions + "\n.endfn test\n")
++            (root / "context.c").write_text(context)
++            flags = ["-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache", "--no-unk-inference",
++                     "--explicit-field-access", "--globals", declarations,
++                     "--context", str(root / "context.c"), str(root / "target.s")]
++            return decompile_and_capture_output(parse_flags(flags))
++
++    def test_context_declarations_are_reachable_only_and_preserve_return_evidence(self):
++        code = self.translate("b lookup", "int test(void); int lookup(); float unused(void);")
++        self.assertIn("int lookup(", code)
++        self.assertNotIn("unused", code)
++        self.assertIn("return lookup(", code)
++        self.assertNotIn("CRASHED", code)
++
++    def test_context_globals_are_declarations_not_duplicate_initializers(self):
++        code = self.translate("lis r3,value@ha\nlwz r3,value@l(r3)\nblr",
++                              "int value = 3; int unused = 7;")
++        self.assertIn("extern int value;", code)
++        self.assertNotIn("= 3", code)
++        self.assertNotIn("unused", code)
++
++    def test_existing_declaration_modes_keep_their_contract(self):
++        for mode in ("used", "none"):
++            code = self.translate("b lookup", "int lookup();", mode)
++            self.assertNotIn("s32 lookup(", code)
++
++    def test_known_typed_prototype_and_array_declaration_survive_generation(self):
++        code = self.translate("lis r3,bytes@ha\naddi r3,r3,bytes@l\nb lookup",
++                              "unsigned char bytes[16]; int lookup(unsigned char *);")
++        self.assertIn("int lookup(unsigned char *);", code)
++        self.assertIn("extern unsigned char bytes[16];", code)
++        self.assertIn("lookup(bytes)", code)
++
++    def test_inferred_integer_call_parameters_retain_register_class(self):
++        code = self.translate("li r3,1\nli r4,2\nb lookup",
++                              "int test(void); int lookup();")
++        self.assertIn("int lookup(s32, s32);", code)
++        self.assertNotIn("M2C_UNK", code)
++
++    def test_inferred_float_call_parameter_does_not_become_integer(self):
++        code = self.translate("li r3,1\nfmr f1,f2\nb lookup",
++                              "int test(float a, float b); int lookup();")
++        self.assertIn("int lookup(s32, f32);", code)
++        self.assertNotIn("M2C_UNK", code)
++
++    def test_context_qualifiers_and_complete_void_parameter_lists_are_preserved(self):
++        code = self.translate("lis r3,value@ha\nlwz r3,value@l(r3)\nb lookup",
++                              "extern volatile const int value; const char *lookup(int);")
++        self.assertIn("extern volatile const int value;", code)
++        self.assertIn("const char *lookup(int);", code)
++        noargs = self.translate("b lookup", "int test(void); int lookup(void);")
++        self.assertIn("int lookup(void);", noargs)
++
++    def test_incomplete_return_pointer_retains_const_when_parameters_are_inferred(self):
++        code = self.translate("li r3,1\nb lookup", "const char *test(void); const char *lookup();")
++        self.assertIn("const char *lookup(s32);", code)
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for raw C syntax checks")
++    def test_integer_address_expression_produces_compilable_raw_load(self):
++        code = self.translate("add r3,r3,r4\nlwz r3,0(r3)\nblr",
++                              "int test(unsigned int base, unsigned int offset);")
++        with tempfile.TemporaryDirectory() as name:
++            path = Path(name) / "draft.c"
++            path.write_text("typedef int s32; typedef unsigned int u32;\n" + code)
++            run = subprocess.run([shutil.which("clang"), "-target", "powerpc-unknown-none",
++                                  "-std=c89", "-fsyntax-only", "-Werror", str(path)],
++                                 capture_output=True, text=True, timeout=30)
++            self.assertEqual(run.returncode, 0, code + run.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()

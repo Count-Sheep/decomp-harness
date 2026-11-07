@@ -1,0 +1,138 @@
+These patches modify m2c: https://github.com/matt-kempster/m2c
+Base revision: 708d2d2cb2698f091a92492b328f73b24209f72d
+
+The patch and its regression tests are distributed under the GNU General
+Public License, version 3, matching upstream m2c. See COPYING in this directory.
+
+Changes made for decomp-harness on 2026-10-02:
+- PPC condition-field comparison and branch tracking.
+- Preservation of condition-field operands on conditional returns.
+- Normalization of symbolic condition-register bit operands.
+- Unit and end-to-end regression fixtures.
+- Startup/finalizer code section parsing and self-entry branch labels.
+- The unconditional self-branch fixture now describes its loop, not recursion.
+- Anonymous switch tables recognized from verified local case labels, with
+  negative tests for numeric data and foreign function pointers.
+- Explicit outer-body extern declarations from a single selected target supply
+  real symbol types; private types and unselected function scopes are excluded.
+- Context-function identity participates in memory and disk type-map caches.
+- Non-final and conditional external PPC tail exits preserve condition fields;
+  unresolved local labels are never converted to calls.
+- Terminal foreign-stack/LR context switches retain an explicit unsupported
+  transfer operation and do not infer a fabricated C return value.
+- PPC CR logical operations track individual bit reads/writes across fields,
+  including constant clear/set idioms and field-qualified symbolic operands.
+- Scheduled ordered floating-point comparison unions retain their original
+  operands and simplify to <= or >= without changing NaN behavior.
+- Floating-point comparisons retain the unordered condition bit as a NaN
+  predicate, rather than treating it as a constant zero.
+- PPC unsigned 32-bit carry/no-borrow dataflow, including extended arithmetic,
+  negative immediates, arithmetic shifts and volatile carry across calls.
+- Dependency-based recovery of scheduled signed division by powers of two;
+  rewrites discard extra output flags only when their values are unused.
+- Dependency-based zero-mask recognition from matched project code, with
+  a negative fixture preserving live output carry.
+- Independent wide-integer arithmetic oracle and synthetic carry regressions.
+- Target-local implicit extern function prototypes retain real return/argument
+  types, and referenced local declarations survive generated body replacement.
+- Named struct/union/enum extern declarations retain the variable name and
+  qualifiers instead of emitting only a tag declaration.
+- Known pointer element sizes convert machine byte offsets into valid C element
+  steps; partial/dynamic offsets retain byte addressing with explicit casts.
+- Pointer regressions cover late inference, array decay, negative steps and
+  existing cross-architecture fixtures without changing raw IR offsets.
+
+Changes made for decomp-harness on 2026-10-03:
+- PPC inferred calls retain the integer/float register prefix needed by later
+  arguments instead of shifting a later value into an earlier ABI slot.
+- Typed nonvariadic signatures remain authoritative; missing register values
+  are not fabricated, and unlikely trailing registers remain omitted.
+- Regression tests cover incoming arguments, independent register classes,
+  variadic tails, missing values and typed/untyped indirect callback calls.
+- Token-aware MWCC section placement handling in C type contexts, preserving
+  diagnostic coordinates, qualifiers, function contracts and struct layout.
+- Alignment, noreturn and mixed/unknown attributes remain unsupported rather
+  than being silently erased. Original owner/source attributes are untouched.
+- Opt-in explicit typed byte-offset access preserves M2C_FIELD's operation
+  without a macro, enabling ordinary C parsing and declaration repair.
+- Native access tests cover loads/stores, signed offsets, width selection,
+  known fields, default compatibility and independent C89 execution.
+- Zero-offset and indexed scalar memory accesses preserve the instruction's
+  load/store width when a known declaration has a different element width.
+- Address casts replace incorrect value conversions; matching declarations
+  and known aggregate members retain their existing source form.
+- Regression coverage includes partial stores, independently executed C89,
+  big-endian halfword code generation, and corrected ARM/MIPS/PPC fixtures.
+- Compatible explicit memory views retain shared type inference, including
+  unsigned load/store updates, without unifying conflicting widths or signs.
+- Incompatible explicit scalar views remain distinct IR expressions despite
+  pointer casts comparing independently of their target types.
+- Tests cover unsigned/signed updates, mixed-width and signedness views,
+  independently compiled UBSan wrapping and high-bit signed/unsigned values.
+
+Changes made for decomp-harness on 2026-10-08:
+- Native m2c used-context declaration mode emits reachable external symbols,
+  preserving authoritative qualifiers, return types, and complete prototypes.
+  Unspecified parameter lists retain inferred argument types; context globals
+  with initializers are declared externally rather than redefined.
+- PPC inferred call signatures retain the ABI's integer/floating register class,
+  including literal arguments whose types are deliberately cloned during inference.
+- Pointer-valued arithmetic over integer operands emits an explicit C address cast.
+- Explicit memory access formatting handles unknown zero-offset addresses with
+  typed pointer casts, preserving the load/store width without output repair.
+- Native tests cover context declarations, qualifiers, unknown argument types,
+  integer/float register classes, and independent C89 compilation.
+- Floating-point loads from nonzero readonly-pool offsets fold using exact
+  captured bytes, not inferred symbol names or guessed constant values.
+- AsmDataEntry rejects negative/out-of-bounds reads and interior reads of
+  relocation-backed symbolic data instead of using Python negative slicing or
+  returning a whole relocation for a partial access.
+- Regressions preserve negative zero, distinguish writable data, and exercise
+  scalar pool offsets and relocation read boundaries.
+- Valid-syntax pointer declarations use void only for completely unconstrained,
+  unsized pointees. Width and floating-point evidence remain intact.
+- Unknown callees with unconstrained, unused return values receive a void
+  prototype without mutating inference or changing authoritative context types.
+- Silent register reinterpretations preserve required integer/pointer casts in
+  valid C output, including values returned by context-declared functions.
+- Overlapping PPC stack accesses share lazy union-backed storage with explicit
+  widths and signedness; partial writes materialize pending overlapping reads.
+- Quantized stores without supported semantics fail explicitly, while proven
+  callee-save stores remain elided. They are no longer silently discarded.
+- Regression tests cover big-endian byte selection, halfword signedness, narrow
+  stores preceding wider reads, partial writes, and pending-read preservation.
+- Add an opt-in MWCC negative fused-subtraction expression variant. Default
+  generation remains unchanged. This is a compiler-matching candidate, not a
+  general IEEE-equivalent rewrite; compiled bytes and relocations still require
+  validation before acceptance.
+- Valid-syntax arithmetic on unsized pointers uses explicit byte offsets and
+  retains the inferred result type. Compound assignment cannot reintroduce
+  void-pointer arithmetic. Tests include independent PowerPC C89 compilation.
+- Unsized pointer offsets preserve ambiguous integer-or-pointer result types
+  consistently with declarations, rather than forcing the base pointer type.
+- Add opt-in PPC local stack storage using bounded union-backed typed memory
+  views. Exclude ABI headers and saved registers; reject unsupported alignment.
+  Default generation remains unchanged. Include independent raw C compilation,
+  mixed-width and signedness tests, and saved-register boundary checks.
+- In valid C, lower anonymous pointer-only type cycles to opaque pointers with
+  explicit typed dereferences and byte offsets. Keep outer pointer depth and
+  named types, and preserve ordinary output mode. Test C89 compilation.
+- Reuse inferred PPC call register prefixes across translation passes when all
+  values and register classes are available. Do not invent missing values,
+  override explicit prototypes, or infer unsupported wide/interleaved arguments.
+- Emit opaque pointers for unsized unknown field pointees in valid-syntax mode,
+  without changing inferred types, sized unknowns, or unknown values by value.
+- Include address-only local buffers in opt-in PPC stack storage. Require an
+  address inside the allocated local region, excluding ABI and saved registers;
+  test direct C89 compilation and out-of-region address rejection.
+- Preserve inferred integer or pointer result representations for sized pointer
+  offsets in valid-syntax mode, retaining byte arithmetic and ordinary output.
+- Lower supported float/integer bit reinterpretations to function-local union
+  temporaries in valid C. Evaluate once, read full-width bits before narrowing,
+  and keep unsupported types or file-scope conversions explicitly unresolved.
+- Sanitize assembler symbol punctuation consistently in valid C declarations
+  and uses, preserving the original symbol for ordinary output.
+- Emit valid pointer/integer comparisons by casting the integer operand to the
+  inferred pointer type, regardless of operand order.
+- Keep large global byte offsets explicit rather than folding them into a
+  transparent access that obscures address materialization from the compiler.

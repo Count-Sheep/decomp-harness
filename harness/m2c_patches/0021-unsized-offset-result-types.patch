@@ -1,0 +1,42 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 290c49a..1ca78d0 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -71,6 +71,7 @@ from .types import (
+     FunctionSignature,
+     StructDeclaration,
+     Type,
++    TypeData,
+     TypePool,
+ )
+ 
+@@ -1328,7 +1329,8 @@ class BinaryOp(Condition):
+             base, offset, size = pointer
+             # Register arithmetic uses bytes; C pointer arithmetic uses elements.
+             if not size:
+-                result_type = self.type if self.type.is_pointer() or self.type.is_int() else base.type.decay()
++                result_type = (self.type if self.type.data().kind in
++                               (TypeData.K_INT, TypeData.K_PTR, TypeData.K_INTPTR) else base.type.decay())
+                 return f"(({result_type.format(fmt)}) ((char *) {base.format(fmt)} {self.op} {offset.format(fmt)}))"
+             if isinstance(offset, Literal) and size and offset.value % size == 0:
+                 elements = Literal(offset.value // size, type=Type.s32())
+diff --git a/tests/unit/test_pointer_offsets.py b/tests/unit/test_pointer_offsets.py
+index c9ea94a..ed6c910 100644
+--- a/tests/unit/test_pointer_offsets.py
++++ b/tests/unit/test_pointer_offsets.py
+@@ -33,6 +33,15 @@ class TestPointerOffsets(unittest.TestCase):
+         expr = BinaryOp(pointer, '-', other, Type.s32())
+         self.assertIsNone(expr.pointer_offset(include_unsized=True))
+ 
++    def test_unsized_offset_matches_ambiguous_register_declaration(self):
++        fmt = Formatter(valid_syntax=True)
++        pointer = GlobalSymbol('cursor', Type.ptr())
++        result_type = Type.intptr()
++        expr = BinaryOp(pointer, '+', Literal(4), result_type)
++        self.assertEqual(result_type.format(fmt), 's32')
++        self.assertEqual(expr.format(fmt), '((s32) ((char *) cursor + 4))')
++        self.assertEqual(expr.format(Formatter()), '(cursor + 4)')
++
+     def test_literal_offsets_are_converted_from_bytes_without_changing_the_ir(self):
+         for element in (Type.u8(), Type.u16(), Type.u32(), Type.u64()):
+             size = element.get_size_bytes()

@@ -1,0 +1,95 @@
+diff --git a/src/compiler.py b/src/compiler.py
+index d9161dd..328f895 100644
+--- a/src/compiler.py
++++ b/src/compiler.py
+@@ -1,4 +1,6 @@
+-from typing import Optional
++from typing import List, Optional
++import json
++import os
+ import tempfile
+ import subprocess
+ import shutil
+@@ -6,6 +8,20 @@ import shutil
+ from .helpers import try_remove
+ 
+ 
++def _direct_argv(compile_cmd: str) -> Optional[List[str]]:
++    path = os.path.join(os.path.dirname(os.path.abspath(compile_cmd)), "compile_cmd.json")
++    if not os.path.isfile(path):
++        return None
++    with open(path, encoding="utf-8") as f:
++        value = json.load(f)
++    argv = value.get("argv") if isinstance(value, dict) else None
++    if value.get("supported") is False or not isinstance(argv, list) or not argv:
++        return None
++    if not all(isinstance(part, str) for part in argv):
++        raise Exception(f"{path}: argv must be a list of strings")
++    return argv
++
++
+ class Compiler:
+     def __init__(
+         self, compile_cmd: str, *, show_errors: bool, debug_mode: bool
+@@ -14,11 +30,20 @@ class Compiler:
+         self.show_errors = show_errors
+         self.debug_mode = debug_mode
+ 
++        # A compile_cmd.json next to compile.sh may give the compiler argv directly:
++        # {"argv": [...]}; the permuter appends "-c SOURCE -o OUTPUT". This avoids a shell
++        # per candidate and needs no bash, which matters most on Windows.
++        self._argv = _direct_argv(compile_cmd)
++        if self._argv is not None:
++            self._bash = ""
++            return
++
+         bash = shutil.which("bash")
+         if bash is None:
+             raise Exception(
+                 "No `bash` executable was found on PATH. Install bash and make "
+-                "sure it's on PATH (on Windows, Git for Windows provides one)."
++                "sure it's on PATH (on Windows, Git for Windows provides one), "
++                "or provide a compile_cmd.json with a direct compiler argv."
+             )
+         self._bash = bash
+ 
+@@ -48,11 +73,12 @@ class Compiler:
+ 
+         try:
+             stderr = 2 if show_errors else subprocess.DEVNULL
+-            subprocess.check_call(
+-                [self._bash, self.compile_cmd, c_name, "-o", o_name],
+-                stdout=stderr,
+-                stderr=stderr,
++            command = (
++                [*self._argv, "-c", c_name, "-o", o_name]
++                if self._argv is not None
++                else [self._bash, self.compile_cmd, c_name, "-o", o_name]
+             )
++            subprocess.check_call(command, stdout=stderr, stderr=stderr)
+         except subprocess.CalledProcessError:
+             if not show_errors:
+                 try_remove(c_name)
+diff --git a/src/preprocess.py b/src/preprocess.py
+index 8447a80..f49b9af 100644
+--- a/src/preprocess.py
++++ b/src/preprocess.py
+@@ -1,10 +1,17 @@
+ from typing import List
++import shutil
+ import subprocess
+ 
+ 
+ def preprocess(filename: str, cpp_args: List[str] = []) -> str:
++    cpp = shutil.which("cpp")
++    if cpp is None:
++        # Without a C preprocessor (common on Windows), use the file as is. This is
++        # correct for already-preprocessed sources such as harness work units.
++        with open(filename, encoding="utf-8") as f:
++            return f.read()
+     return subprocess.check_output(
+-        ["cpp"] + cpp_args + ["-P", "-nostdinc", "-DPERMUTER", filename],
++        [cpp] + cpp_args + ["-P", "-nostdinc", "-DPERMUTER", filename],
+         universal_newlines=True,
+         encoding="utf-8",
+     )

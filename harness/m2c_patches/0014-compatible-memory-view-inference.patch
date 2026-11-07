@@ -1,0 +1,140 @@
+diff --git a/m2c/evaluate.py b/m2c/evaluate.py
+index 7e712dd..1d5ba9a 100644
+--- a/m2c/evaluate.py
++++ b/m2c/evaluate.py
+@@ -157,6 +157,7 @@ def deref(
+         field_type if field_path is not None else var.type.get_pointer_target()
+     )
+     declared_size = declared_type.get_size_bytes() if declared_type is not None else None
++    explicit_view = None
+     if (
+         memory_type is not None
+         and offset == 0
+@@ -167,8 +168,11 @@ def deref(
+         and not declared_type.is_array()
+     ):
+         # Zero-offset simplification must not replace a memory access with a value cast.
+-        var = as_type(var, Type.ptr(memory_type), silent=False, unify=False)
+-        type = memory_type
++        if not type.unify(memory_type):
++            type = memory_type
++            # Cast equality ignores types; incompatible memory views must not fold together.
++            explicit_view = (type.data().kind, type.data().sign)
++        var = as_type(var, Type.ptr(type), silent=False, unify=False)
+         field_path, _, _ = var.type.get_deref_field(offset, target_size=size)
+     elif field_path is not None:
+         field_type.unify(type)
+@@ -183,6 +187,7 @@ def deref(
+         field_path=field_path,
+         stack_info=stack_info,
+         type=type,
++        explicit_view=explicit_view,
+     )
+ 
+ 
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 3532d38..7c88403 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1565,6 +1565,7 @@ class StructAccess(Expression):
+     stack_info: Optional[StackInfo] = field(compare=False, repr=False)
+     type: Type = field(compare=False)
+     checked_late_field_path: bool = field(default=False, compare=False)
++    explicit_view: Optional[Tuple[int, int]] = None
+ 
+     def __post_init__(self) -> None:
+         # stack_info is used to resolve field_path late
+diff --git a/tests/unit/test_memory_widths.py b/tests/unit/test_memory_widths.py
+index 27ce561..e4689d8 100644
+--- a/tests/unit/test_memory_widths.py
++++ b/tests/unit/test_memory_widths.py
+@@ -54,6 +54,76 @@ class TestMemoryWidths(unittest.TestCase):
+         self.assertIn("(char *)(bytes)", offset)
+         self.assertIn("u32 *", offset)
+ 
++    def test_unsigned_halfword_update_preserves_the_load_view(self):
++        for native in (False, True):
++            generated = self.translate("lhz r4,0(r3)\naddi r4,r4,1\nsth r4,0(r3)\nlhz r3,0(r3)",
++                                       "unsigned short test(unsigned char *bytes);", native=native)
++            self.assertIn("*(u16 *) bytes += 1;", generated)
++            self.assertNotIn("*(s16 *)", generated)
++
++    def test_signed_halfword_update_keeps_the_signed_load_view(self):
++        generated = self.translate("lha r4,0(r3)\naddi r4,r4,1\nsth r4,0(r3)\nlha r3,0(r3)",
++                                   "short test(unsigned char *bytes);")
++        self.assertIn("*(s16 *) bytes += 1;", generated)
++        self.assertIn("return *(s16 *) bytes;", generated)
++
++    def test_conflicting_width_and_signedness_views_stay_independent(self):
++        mixed = self.translate("lwz r4,0(r3)\nlhz r5,0(r3)\nadd r3,r4,r5",
++                               "unsigned int test(unsigned char *bytes);")
++        self.assertIn("*(s32 *) bytes", mixed)
++        self.assertIn("*(u16 *) bytes", mixed)
++        for first, second in (("lha", "lhz"), ("lhz", "lha")):
++            signed = self.translate(first + " r4,0(r3)\n" + second + " r5,0(r3)\nadd r3,r4,r5",
++                                    "int test(unsigned char *bytes);")
++            self.assertIn("*(s16 *) bytes", signed)
++            self.assertIn("*(u16 *) bytes", signed)
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for independent C execution")
++    def test_unsigned_updates_execute_with_wrapping_and_preserve_adjacent_memory(self):
++        for load, store, c_type, alias, maximum in (
++            ("lhz", "sth", "unsigned short", "u16", "0xFFFFU"),
++            ("lwz", "stw", "unsigned int", "u32", "0xFFFFFFFFU"),
++        ):
++            with self.subTest(load=load), tempfile.TemporaryDirectory() as name:
++                generated = self.translate(
++                    load + " r4,0(r3)\naddi r4,r4,1\n" + store + " r4,0(r3)\n" + load + " r3,0(r3)",
++                    c_type + " test(unsigned char *bytes);",
++                )
++                self.assertIn("*(" + alias + " *) bytes += 1;", generated)
++                source = ("typedef unsigned int u32; typedef unsigned short u16; typedef unsigned char u8;\n"
++                          + generated + "\nint main(void) { " + c_type + " words[2]; unsigned int i; "
++                          "unsigned int values[]={0U,1U," + maximum + ",(" + maximum + " >> 1),"
++                          "(" + maximum + " >> 1)+1U}; for(i=0;i<5;i++) { "
++                          "words[0]=(" + c_type + ")values[i]; words[1]=0x1234U; "
++                          "if(test((unsigned char *)words)!=(" + c_type + ")(values[i]+1U)) return 1; "
++                          "if(words[1]!=0x1234U) return 2; } return 0; }\n")
++                path, executable = Path(name) / "test.c", Path(name) / "test"
++                path.write_text(source)
++                compiled = subprocess.run([shutil.which("clang"), "-std=c89", "-O2", "-Wall", "-Werror",
++                                           "-fsanitize=undefined", "-fno-sanitize-recover=undefined",
++                                           str(path), "-o", str(executable)], capture_output=True, text=True, timeout=30)
++                self.assertEqual(compiled.returncode, 0, compiled.stderr)
++                self.assertEqual(subprocess.run([str(executable)], timeout=10).returncode, 0)
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for independent C execution")
++    def test_mixed_signed_unsigned_loads_execute_without_collapsing_their_values(self):
++        generated = self.translate("lha r4,0(r3)\nlhz r5,0(r3)\nadd r3,r4,r5",
++                                   "int test(unsigned char *bytes);")
++        with tempfile.TemporaryDirectory() as name:
++            source = ("typedef int s32; typedef short s16; typedef unsigned short u16; typedef unsigned char u8;\n"
++                      + generated + "\nint main(void) { unsigned short word; unsigned int i; "
++                      "unsigned short values[]={0U,1U,0x7FFFU,0x8000U,0xFFFFU}; "
++                      "int expected[]={0,2,65534,0,65534}; "
++                      "for(i=0;i<5;i++) { word=values[i]; "
++                      "if(test((unsigned char *)&word)!=expected[i]) return 1; } return 0; }\n")
++            path, executable = Path(name) / "test.c", Path(name) / "test"
++            path.write_text(source)
++            compiled = subprocess.run([shutil.which("clang"), "-std=c89", "-O2", "-Wall", "-Werror",
++                                       "-fsanitize=undefined", "-fno-sanitize-recover=undefined",
++                                       str(path), "-o", str(executable)], capture_output=True, text=True, timeout=30)
++            self.assertEqual(compiled.returncode, 0, compiled.stderr)
++            self.assertEqual(subprocess.run([str(executable)], timeout=10).returncode, 0)
++
+     def test_indexed_access_keeps_byte_index_and_instruction_width(self):
+         word = self.translate("lwzx r3,r3,r4", "unsigned int test(unsigned char *bytes, unsigned int offset);")
+         self.assertIn("u32 *", word)
+diff --git a/tests/end_to_end/custom_stack/agbcc-o2-out.c b/tests/end_to_end/custom_stack/agbcc-o2-out.c
+index fbd26e5..be4e590 100644
+--- a/tests/end_to_end/custom_stack/agbcc-o2-out.c
++++ b/tests/end_to_end/custom_stack/agbcc-o2-out.c
+@@ -29,7 +29,7 @@ s32 test(void *arg0) {
+     frob(&sp0);
+     temp_r1 = arg0->unk0;
+     temp_r3 = arg0->unk4;
+-    *(s8 *) &spC = temp_r1 + temp_r3;
++    *(u8 *) &spC = temp_r1 + temp_r3;
+     temp_r2 = arg0->unk8;
+     sp0.unkE = (s16) (temp_r1 + temp_r2);
+     temp_r5 = temp_r3 + temp_r2;

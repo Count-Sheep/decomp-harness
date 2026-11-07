@@ -1,0 +1,226 @@
+diff --git a/m2c/c_types.py b/m2c/c_types.py
+index 55683ca..b4b5502 100644
+--- a/m2c/c_types.py
++++ b/m2c/c_types.py
+@@ -100,7 +100,7 @@ class Enum:
+ @dataclass(eq=False)
+ class TypeMap:
+     # Change VERSION if TypeMap changes to invalidate all preexisting caches
+-    VERSION: ClassVar[int] = 10
++    VERSION: ClassVar[int] = 11
+ 
+     source_hash: str
+     base_struct_align: int
+@@ -824,17 +824,21 @@ def parse_c(
+     return ast, c_parser._scope_stack[0].copy()
+ 
+ 
+-def build_typemap(source_paths: List[Path], arch: ArchC, use_cache: bool) -> TypeMap:
++def build_typemap(
++    source_paths: List[Path], arch: ArchC, use_cache: bool,
++    context_function: Optional[str] = None,
++) -> TypeMap:
+     # Wrapper to convert `source_paths` into a hashable type
+-    return _build_typemap(tuple(source_paths), arch, use_cache)
++    return _build_typemap(tuple(source_paths), arch, use_cache, context_function)
+ 
+ 
+ @functools.lru_cache(maxsize=16)
+ def _build_typemap(
+-    source_paths: Tuple[Path, ...], arch: ArchC, use_cache: bool
++    source_paths: Tuple[Path, ...], arch: ArchC, use_cache: bool,
++    context_function: Optional[str],
+ ) -> TypeMap:
+     typemap = TypeMap(
+-        source_hash=f"root:{TypeMap.VERSION},{arch.base_struct_align}",
++        source_hash=f"root:{TypeMap.VERSION},{arch.base_struct_align},{context_function!r}",
+         base_struct_align=arch.base_struct_align,
+     )
+ 
+@@ -957,6 +961,42 @@ def _build_typemap(
+             def visit_FuncDef(self, node: ca.FuncDef) -> None:
+                 if node.decl.name is not None:
+                     typemap.var_types[node.decl.name] = type_from_global_decl(node.decl)
++                if node.decl.name != context_function:
++                    return
++                # Only outer-body externs are unambiguous for the selected target.
++                items = node.body.block_items or []
++                local_types = {item.name for item in items if isinstance(item, ca.Typedef)}
++                local_tags = {
++                    item.type.name for item in items
++                    if isinstance(item, ca.Decl) and isinstance(item.type, (ca.Struct, ca.Union))
++                    and item.type.decls is not None
++                }
++
++                class LocalTypes(ca.NodeVisitor):
++                    found = False
++
++                    def visit_IdentifierType(self, type: ca.IdentifierType) -> None:
++                        self.found |= any(name in local_types for name in type.names)
++
++                    def visit_Struct(self, type: ca.Struct) -> None:
++                        self.found |= type.name in local_tags or type.decls is not None
++
++                    visit_Union = visit_Struct
++
++                for item in items:
++                    if not isinstance(item, ca.Decl) or "extern" not in item.storage:
++                        continue
++                    if item.name is None or item.name in typemap.var_types or item.name in typemap.functions:
++                        continue
++                    dependencies = LocalTypes()
++                    dependencies.visit(item.type)
++                    if dependencies.found:
++                        continue
++                    self.visit_Decl(item)
++                    if isinstance(item.type, FuncDecl):
++                        fn = parse_function(item.type)
++                        assert fn is not None
++                        typemap.functions[item.name] = fn
+ 
+         Visitor().visit(ast)
+ 
+diff --git a/m2c/main.py b/m2c/main.py
+index 0ffd969..975f88f 100644
+--- a/m2c/main.py
++++ b/m2c/main.py
+@@ -156,7 +156,15 @@ def run(options: Options) -> int:
+ 
+         if options.heuristic_strings:
+             asm_data.detect_heuristic_strings()
+-        typemap = build_typemap(options.c_contexts, arch, use_cache=options.use_cache)
++        context_function = None
++        if len(options.function_indexes_or_names) == 1:
++            selected = options.function_indexes_or_names[0]
++            if isinstance(selected, str):
++                context_function = arch.c_symbol_name(selected)
++            elif 0 <= selected < len(all_functions):
++                context_function = arch.c_symbol_name(list(all_functions)[selected])
++        typemap = build_typemap(options.c_contexts, arch, use_cache=options.use_cache,
++                               context_function=context_function)
+     except Exception as e:
+         print_exception_as_comment(e, options, context=None)
+         return 1
+diff --git a/tests/unit/test_context_externs.py b/tests/unit/test_context_externs.py
+new file mode 100644
+index 0000000..5a49055
+--- /dev/null
++++ b/tests/unit/test_context_externs.py
+@@ -0,0 +1,74 @@
++from pathlib import Path
++import tempfile
++import unittest
++
++from m2c.arch_ppc import PpcArch
++from m2c.c_types import build_typemap, to_c
++
++
++class TestContextExterns(unittest.TestCase):
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        self.path = Path(temporary.name) / 'context.c'
++        self.arch = PpcArch()
++        self.path.write_text('''
++int first(void) {
++    extern long long clock_value(void);
++    extern int counter;
++    int local;
++    static int local_static;
++    { extern int nested; }
++    return 0;
++}
++int second(void) {
++    extern float clock_value(double);
++    extern float counter;
++    return 0;
++}
++''')
++
++    def test_only_selected_outer_externs_become_symbol_types(self):
++        types = build_typemap([self.path], PpcArch(), False, context_function='first')
++        self.assertEqual(to_c(types.functions['clock_value'].ret_type), 'long long')
++        self.assertEqual(types.functions['clock_value'].params, [])
++        self.assertEqual(to_c(types.var_types['counter']), 'int')
++        for name in ('local', 'local_static', 'nested'):
++            self.assertNotIn(name, types.var_types)
++
++    def test_default_context_does_not_promote_any_local_declarations(self):
++        types = build_typemap([self.path], PpcArch(), False)
++        self.assertNotIn('clock_value', types.functions)
++        self.assertNotIn('counter', types.var_types)
++
++    def test_selected_function_is_part_of_memory_and_disk_cache_identity(self):
++        first = build_typemap([self.path], self.arch, True, context_function='first')
++        second = build_typemap([self.path], self.arch, True, context_function='second')
++        self.assertNotEqual(first.source_hash, second.source_hash)
++        self.assertEqual(to_c(second.functions['clock_value'].ret_type), 'float')
++        self.assertEqual(to_c(second.var_types['counter']), 'float')
++        self.assertEqual(to_c(first.var_types['counter']), 'int')
++
++    def test_existing_global_types_take_precedence(self):
++        self.path.write_text('int counter;\n' + self.path.read_text())
++        types = build_typemap([self.path], PpcArch(), False, context_function='second')
++        self.assertEqual(to_c(types.var_types['counter']), 'int')
++
++    def test_function_private_typedefs_and_tags_are_not_guessed_as_global_types(self):
++        self.path.write_text('''
++struct Shape { int value; };
++int first(void) {
++    typedef double Local;
++    struct Shape { float value; };
++    extern Local hidden_value;
++    extern struct Shape hidden_shape;
++    return 0;
++}
++''')
++        types = build_typemap([self.path], self.arch, False, context_function='first')
++        self.assertNotIn('hidden_value', types.var_types)
++        self.assertNotIn('hidden_shape', types.var_types)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/end_to_end/ppc-context-externs/manual.s b/tests/end_to_end/ppc-context-externs/manual.s
+new file mode 100644
+index 0000000..f50ebec
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-externs/manual.s
+@@ -0,0 +1,6 @@
++.text
++.fn test, global
++lis r3, counter@ha
++lwz r3, counter@l(r3)
++b helper
++.endfn test
+diff --git a/tests/end_to_end/ppc-context-externs/context.c b/tests/end_to_end/ppc-context-externs/context.c
+new file mode 100644
+index 0000000..48c1d15
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-externs/context.c
+@@ -0,0 +1,9 @@
++int test(void) {
++    extern int helper(int);
++    extern int counter;
++    return helper(counter);
++}
++int unrelated(void) {
++    extern float helper(float);
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-context-externs/manual-flags.txt b/tests/end_to_end/ppc-context-externs/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-externs/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-context-externs/manual-out.c b/tests/end_to_end/ppc-context-externs/manual-out.c
+new file mode 100644
+index 0000000..083c7fc
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-externs/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(void) {
++    return helper(counter);
++}

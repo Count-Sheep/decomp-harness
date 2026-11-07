@@ -1,0 +1,705 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+index 166eebe..1fd3e6a 100644
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -71,8 +71,6 @@ from .translate import (
+ )
+ from .evaluate import (
+     add_imm,
+-    carry_add_to,
+-    carry_sub_from,
+     error_stmt,
+     fn_op,
+     fold_divmod,
+@@ -129,6 +127,63 @@ def cr_logical(mnemonic: str, left: Expression, right: Expression) -> Expression
+     return result
+ 
+ 
++PPC_CARRY_INPUT = {"adde", "addme", "addze", "subfe", "subfme", "subfze"}
++PPC_CARRY_OUTPUT = PPC_CARRY_INPUT | {"addc", "addic", "subfc", "subfic", "srawi"}
++
++
++def ppc_carry_result(mnemonic: str, a: InstrArgs) -> tuple[Expression, Expression]:
++    # Preserve the original operand types; XER.CA describes unsigned 32-bit arithmetic.
++    def word(expr: Expression) -> Expression:
++        return as_type(expr, Type.u32(), silent=False, unify=False)
++
++    left = word(a.reg(1))
++    incoming = a.regs[Register("carry")] if mnemonic in PPC_CARRY_INPUT else Literal(0)
++    if mnemonic == "srawi":
++        shift = a.imm_value(2)
++        if not 0 <= shift < 32:
++            raise DecompFailure("Invalid PPC arithmetic shift amount")
++        negative = BinaryOp.icmp(BinaryOp.uint(left, "&", Literal(0x80000000)), "!=", Literal(0))
++        discarded = BinaryOp.icmp(BinaryOp.uint(left, "&", Literal((1 << shift) - 1)), "!=", Literal(0))
++        return handle_shift_right(a, signed=True), BinaryOp(negative, "&&", discarded, type=Type.boolean())
++
++    if mnemonic in {"addc", "adde", "addic", "addme", "addze"}:
++        if mnemonic == "addic":
++            right = word(a.s16_imm(2))
++        elif mnemonic == "addme":
++            right = Literal(0xFFFFFFFF, type=Type.u32())
++        elif mnemonic == "addze":
++            right = Literal(0, type=Type.u32())
++        else:
++            right = word(a.reg(2))
++        base = left if mnemonic == "addze" else BinaryOp.uint(left, "+", right)
++        carry = Literal(0) if mnemonic == "addze" else BinaryOp.ucmp(base, "<", left)
++        if mnemonic in PPC_CARRY_INPUT:
++            value = BinaryOp.uint(base, "+", incoming)
++            overflow = BinaryOp.ucmp(value, "<", base)
++            carry = overflow if mnemonic == "addze" else BinaryOp(carry, "||", overflow, type=Type.boolean())
++        else:
++            value = base
++        return value, carry
++
++    if mnemonic == "subfic":
++        right = word(a.s16_imm(2))
++    elif mnemonic == "subfme":
++        right = Literal(0xFFFFFFFF, type=Type.u32())
++    elif mnemonic == "subfze":
++        right = Literal(0, type=Type.u32())
++    else:
++        right = word(a.reg(2))
++    value = BinaryOp.uint(right, "-", left)
++    if mnemonic in PPC_CARRY_INPUT:
++        value = BinaryOp.uint(value, "-", UnaryOp("!", incoming, type=Type.boolean()))
++        carry = BinaryOp(BinaryOp.ucmp(right, ">", left), "||",
++                         BinaryOp(BinaryOp.ucmp(right, "==", left), "&&", incoming, type=Type.boolean()),
++                         type=Type.boolean())
++    else:
++        carry = BinaryOp.ucmp(right, ">=", left)
++    return value, carry
++
++
+ class FcmpoCrorPattern(SimpleAsmPattern):
+     """
+     For floating point, `x <= y` and `x >= y` use `cror` to OR together the `cr0_eq`
+@@ -312,6 +367,21 @@ class CmpnezPattern1(IrPattern):
+     ]
+ 
+ 
++class ZeroMaskPattern(IrPattern):
++    replacement = "cmpzero.mask.fictive $o, $i"
++    parts = ["addic $a, $i, -1", "subfe $o, $a, $a"]
++
++
++class SignedShiftDivisionPattern(IrPattern):
++    # Match dependencies rather than adjacency: MWCC schedules work between the pair.
++    replacement = "divpow2.fictive $o, $i, N"
++    parts = ["srawi $a, $i, N", "addze $o, $a"]
++
++    def check(self, m: IrMatch, arch: ArchFlowGraph, flow_graph: FlowGraph) -> bool:
++        shift = m.symbolic_args.get("N")
++        return isinstance(shift, AsmLiteral) and 0 <= shift.value < 31
++
++
+ class CmpnezPattern2(IrPattern):
+     replacement = "cmpnez.fictive $o, $i"
+     parts = [
+@@ -825,6 +895,7 @@ class PpcArch(Arch):
+                 "cr0_eq",
+                 "cr0_so",
+                 "ctr",
++                "carry",
+             ]
+         ]
+     )
+@@ -1454,9 +1525,9 @@ class PpcArch(Arch):
+             else:
+                 assert not any(isinstance(a, AsmAddressMode) for a in args)
+                 inputs = [r for r in args[1:] if isinstance(r, Register)]
+-            if mnemonic.rstrip(".") in ("adde", "addme", "addze", "subfe", "subfze"):
++            if mnemonic.rstrip(".") in PPC_CARRY_INPUT:
+                 inputs.append(Register("carry"))
+-            if mnemonic.rstrip(".") in ("addc", "addic", "subfc", "subfic"):
++            if mnemonic.rstrip(".") in PPC_CARRY_OUTPUT:
+                 outputs.append(Register("carry"))
+             if mnemonic.endswith("."):
+                 # Instructions ending in `.` update the condition reg
+@@ -1464,7 +1535,13 @@ class PpcArch(Arch):
+ 
+             def eval_fn(s: NodeState, a: InstrArgs) -> None:
+                 target = a.reg_ref(0)
+-                val = cls.instrs_destination_first[mnemonic.rstrip(".")](a)
++                base = mnemonic.rstrip(".")
++                carry = None
++                if base in PPC_CARRY_OUTPUT:
++                    value, carry = ppc_carry_result(base, a)
++                    val = value if base in PPC_CARRY_INPUT else cls.instrs_destination_first[base](a)
++                else:
++                    val = cls.instrs_destination_first[base](a)
+                 target_val = s.set_reg(target, val)
+                 # Instructions ending in `.` update the condition reg
+                 if mnemonic.endswith("."):
+@@ -1491,11 +1568,8 @@ class PpcArch(Arch):
+                         Register("cr0_so"),
+                         fn_op("M2C_OVERFLOW", [target_val], type=Type.s32()),
+                     )
+-                if Register("carry") in outputs:
+-                    s.set_reg(
+-                        Register("carry"),
+-                        fn_op("M2C_CARRY", [target_val], type=Type.s32()),
+-                    )
++                if carry is not None:
++                    s.set_reg(Register("carry"), carry)
+ 
+         elif mnemonic in ("mtctr", "mtlr"):
+             assert len(args) == 1 and isinstance(args[0], Register)
+@@ -1652,6 +1726,8 @@ class PpcArch(Arch):
+         UintToDoubleIrPattern(),
+         SintToFloatIrPattern(),
+         UintToFloatIrPattern(),
++        SignedShiftDivisionPattern(),
++        ZeroMaskPattern(),
+         CmpnezPattern1(),
+         CmpnezPattern2(),
+         CmplezPattern(),
+@@ -1802,11 +1878,13 @@ class PpcArch(Arch):
+ 
+     instrs_dest_first_non_load: InstrMap = {
+         # Integer arithmetic
+-        # TODO: Read XER_CA in extended instrs, instead of using CarryBit
+         "add": lambda a: handle_add(a),
+         "addc": lambda a: handle_add(a),
+-        "adde": lambda a: carry_add_to(handle_add(a)),
+-        "addze": lambda a: carry_add_to(a.reg(1)),
++        "adde": lambda a: ppc_carry_result("adde", a)[0],
++        "addme": lambda a: ppc_carry_result("addme", a)[0],
++        "addze": lambda a: ppc_carry_result("addze", a)[0],
++        "divpow2.fictive": lambda a: BinaryOp.sint(a.reg(1), "/", Literal(1 << a.imm_value(2))),
++        "cmpzero.mask.fictive": lambda a: UnaryOp("-", BinaryOp.icmp(a.reg(1), "==", Literal(0)), type=Type.s32()),
+         "addi": lambda a: handle_addi(
+             a.reg_ref(0), a.reg_ref(1), a.reg(1), a.s16_imm(2), a
+         ),
+@@ -1816,13 +1894,10 @@ class PpcArch(Arch):
+         "addis": lambda a: handle_addis(a),
+         "subf": lambda a: fold_divmod(BinaryOp.intptr(a.reg(2), "-", a.reg(1))),
+         "subfc": lambda a: fold_divmod(BinaryOp.intptr(a.reg(2), "-", a.reg(1))),
+-        "subfe": lambda a: carry_sub_from(
+-            fold_divmod(BinaryOp.intptr(a.reg(2), "-", a.reg(1)))
+-        ),
++        "subfe": lambda a: ppc_carry_result("subfe", a)[0],
++        "subfme": lambda a: ppc_carry_result("subfme", a)[0],
+         "subfic": lambda a: fold_divmod(BinaryOp.intptr(a.s16_imm(2), "-", a.reg(1))),
+-        "subfze": lambda a: carry_sub_from(
+-            fold_mul_chains(UnaryOp.sint("-", a.reg(1))),
+-        ),
++        "subfze": lambda a: ppc_carry_result("subfze", a)[0],
+         "neg": lambda a: fold_mul_chains(UnaryOp.sint("-", a.reg(1))),
+         "divw": lambda a: BinaryOp.sint(a.reg(1), "/", a.reg(2)),
+         "divwu": lambda a: BinaryOp.uint(a.reg(1), "/", a.reg(2)),
+diff --git a/m2c/ir_pattern.py b/m2c/ir_pattern.py
+index a591aea..2ed3b3b 100644
+--- a/m2c/ir_pattern.py
++++ b/m2c/ir_pattern.py
+@@ -348,10 +348,11 @@ def simplify_ir_patterns(
+         # This simplifies the replacement step because we can replace the final
+         # instruction and know that all the pattern inputs have been assigned
+         # by there, and the output has not yet been used.
+-        assert pattern.replacement_instr.outputs == tail_ref.instruction.outputs, (
++        assert set(pattern.replacement_instr.outputs) <= set(tail_ref.instruction.outputs), (
+             pattern.replacement_instr.outputs,
+             tail_ref.instruction.outputs,
+         )
++        discarded_outputs = set(tail_ref.instruction.outputs) - set(pattern.replacement_instr.outputs)
+ 
+         # Start matches with a mnemonic match for the last instruction in the pattern
+         for cand_tail_ref in refs_by_mnemonic.get(tail_ref.instruction.mnemonic, []):
+@@ -378,6 +379,11 @@ def simplify_ir_patterns(
+             if not is_match:
+                 continue
+ 
++            # A replacement may omit flags, but only when no later instruction reads them.
++            if any(flow_graph.instr_uses[cand_tail_ref].get(state.map_location(loc))
++                   for loc in discarded_outputs):
++                continue
++
+             # At this point, all instructions in the patterns are guaranteed to map
+             # one source instruction. Create a list of those, for use by `check`.
+             for pat_ref in body_refs + [tail_ref]:
+diff --git a/tests/end_to_end/ppc-call-clobbers-carry/context.c b/tests/end_to_end/ppc-call-clobbers-carry/context.c
+new file mode 100644
+index 0000000..5b06d56
+--- /dev/null
++++ b/tests/end_to_end/ppc-call-clobbers-carry/context.c
+@@ -0,0 +1,2 @@
++int produce(void);
++int test(int value);
+diff --git a/tests/end_to_end/ppc-call-clobbers-carry/manual.s b/tests/end_to_end/ppc-call-clobbers-carry/manual.s
+new file mode 100644
+index 0000000..6f61cfb
+--- /dev/null
++++ b/tests/end_to_end/ppc-call-clobbers-carry/manual.s
+@@ -0,0 +1,6 @@
++.global test
++test:
++addic r4, r3, -1
++bl produce
++addze r3, r3
++blr
+diff --git a/tests/end_to_end/ppc-call-clobbers-carry/manual-out.c b/tests/end_to_end/ppc-call-clobbers-carry/manual-out.c
+new file mode 100644
+index 0000000..853cd8c
+--- /dev/null
++++ b/tests/end_to_end/ppc-call-clobbers-carry/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(s32 value) {
++    return (s32) (produce() + (u32) M2C_ERROR(/* Read from unset register $carry */));
++}
+diff --git a/tests/end_to_end/ppc-call-clobbers-carry/manual-flags.txt b/tests/end_to_end/ppc-call-clobbers-carry/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-call-clobbers-carry/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-carry-chain/context.c b/tests/end_to_end/ppc-carry-chain/context.c
+new file mode 100644
+index 0000000..b9f5c37
+--- /dev/null
++++ b/tests/end_to_end/ppc-carry-chain/context.c
+@@ -0,0 +1,3 @@
++typedef unsigned int u32;
++typedef struct { u32 first, second, third; } Output;
++void test(Output *out, u32 a, u32 b, u32 c);
+diff --git a/tests/end_to_end/ppc-carry-chain/manual.s b/tests/end_to_end/ppc-carry-chain/manual.s
+new file mode 100644
+index 0000000..639d855
+--- /dev/null
++++ b/tests/end_to_end/ppc-carry-chain/manual.s
+@@ -0,0 +1,9 @@
++.global test
++test:
++addc r4, r4, r5
++stw r4, 0(r3)
++adde r5, r5, r6
++stw r5, 4(r3)
++addze r6, r6
++stw r6, 8(r3)
++blr
+diff --git a/tests/end_to_end/ppc-carry-chain/manual-out.c b/tests/end_to_end/ppc-carry-chain/manual-out.c
+new file mode 100644
+index 0000000..f1b625d
+--- /dev/null
++++ b/tests/end_to_end/ppc-carry-chain/manual-out.c
+@@ -0,0 +1,8 @@
++void test(Output *out, u32 a, u32 b, u32 c) {
++    u32 temp_carry;
++
++    temp_carry = (u32) (a + b) < a;
++    out->first = a + b;
++    out->second = (u32) (b + c) + temp_carry;
++    out->third = c + (u32) (((u32) (b + c) < b) || ((u32) ((u32) (b + c) + temp_carry) < (u32) (b + c)));
++}
+diff --git a/tests/end_to_end/ppc-carry-chain/manual-flags.txt b/tests/end_to_end/ppc-carry-chain/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-carry-chain/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-zero-mask/context.c b/tests/end_to_end/ppc-zero-mask/context.c
+new file mode 100644
+index 0000000..cf6d05e
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask/context.c
+@@ -0,0 +1 @@
++int test(unsigned int value);
+diff --git a/tests/end_to_end/ppc-zero-mask/manual.s b/tests/end_to_end/ppc-zero-mask/manual.s
+new file mode 100644
+index 0000000..7a9e0a5
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask/manual.s
+@@ -0,0 +1,6 @@
++.global test
++test:
++addic r4, r3, -1
++subfe r3, r4, r4
++addi r3, r3, 153
++blr
+diff --git a/tests/end_to_end/ppc-zero-mask/manual-out.c b/tests/end_to_end/ppc-zero-mask/manual-out.c
+new file mode 100644
+index 0000000..bd03b80
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(u32 value) {
++    return -(value == 0) + 0x99;
++}
+diff --git a/tests/end_to_end/ppc-zero-mask/manual-flags.txt b/tests/end_to_end/ppc-zero-mask/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-overwritten-shift-carry/context.c b/tests/end_to_end/ppc-overwritten-shift-carry/context.c
+new file mode 100644
+index 0000000..1552f4f
+--- /dev/null
++++ b/tests/end_to_end/ppc-overwritten-shift-carry/context.c
+@@ -0,0 +1 @@
++int test(int value, int other);
+diff --git a/tests/end_to_end/ppc-overwritten-shift-carry/manual.s b/tests/end_to_end/ppc-overwritten-shift-carry/manual.s
+new file mode 100644
+index 0000000..7709c76
+--- /dev/null
++++ b/tests/end_to_end/ppc-overwritten-shift-carry/manual.s
+@@ -0,0 +1,6 @@
++.global test
++test:
++srawi r5, r3, 2
++addic r4, r4, -1
++addze r3, r5
++blr
+diff --git a/tests/end_to_end/ppc-overwritten-shift-carry/manual-out.c b/tests/end_to_end/ppc-overwritten-shift-carry/manual-out.c
+new file mode 100644
+index 0000000..4461bde
+--- /dev/null
++++ b/tests/end_to_end/ppc-overwritten-shift-carry/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(s32 value, s32 other) {
++    return (s32) ((u32) (value >> 2) + (u32) ((u32) ((u32) other - 1U) < (u32) other));
++}
+diff --git a/tests/end_to_end/ppc-overwritten-shift-carry/manual-flags.txt b/tests/end_to_end/ppc-overwritten-shift-carry/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-overwritten-shift-carry/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-borrow-chain/context.c b/tests/end_to_end/ppc-borrow-chain/context.c
+new file mode 100644
+index 0000000..b9f5c37
+--- /dev/null
++++ b/tests/end_to_end/ppc-borrow-chain/context.c
+@@ -0,0 +1,3 @@
++typedef unsigned int u32;
++typedef struct { u32 first, second, third; } Output;
++void test(Output *out, u32 a, u32 b, u32 c);
+diff --git a/tests/end_to_end/ppc-borrow-chain/manual.s b/tests/end_to_end/ppc-borrow-chain/manual.s
+new file mode 100644
+index 0000000..c5d87e1
+--- /dev/null
++++ b/tests/end_to_end/ppc-borrow-chain/manual.s
+@@ -0,0 +1,9 @@
++.global test
++test:
++subfc r4, r4, r5
++stw r4, 0(r3)
++subfe r5, r5, r6
++stw r5, 4(r3)
++subfze r6, r6
++stw r6, 8(r3)
++blr
+diff --git a/tests/end_to_end/ppc-borrow-chain/manual-out.c b/tests/end_to_end/ppc-borrow-chain/manual-out.c
+new file mode 100644
+index 0000000..813838c
+--- /dev/null
++++ b/tests/end_to_end/ppc-borrow-chain/manual-out.c
+@@ -0,0 +1,8 @@
++void test(Output *out, u32 a, u32 b, u32 c) {
++    s32 temp_carry;
++
++    temp_carry = b >= a;
++    out->first = b - a;
++    out->second = (u32) (c - b) - (u32) !temp_carry;
++    out->third = (u32) (0U - c) - (u32) !((c > b) || ((c == b) && temp_carry));
++}
+diff --git a/tests/end_to_end/ppc-borrow-chain/manual-flags.txt b/tests/end_to_end/ppc-borrow-chain/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-borrow-chain/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-live-shift-carry/context.c b/tests/end_to_end/ppc-live-shift-carry/context.c
+new file mode 100644
+index 0000000..fa26442
+--- /dev/null
++++ b/tests/end_to_end/ppc-live-shift-carry/context.c
+@@ -0,0 +1,2 @@
++typedef struct { int quotient, next; } Output;
++void test(int value, Output *out, int scratch, unsigned int high);
+diff --git a/tests/end_to_end/ppc-live-shift-carry/manual.s b/tests/end_to_end/ppc-live-shift-carry/manual.s
+new file mode 100644
+index 0000000..86a9dc0
+--- /dev/null
++++ b/tests/end_to_end/ppc-live-shift-carry/manual.s
+@@ -0,0 +1,8 @@
++.global test
++test:
++srawi r5, r3, 2
++addze r5, r5
++stw r5, 0(r4)
++addze r6, r6
++stw r6, 4(r4)
++blr
+diff --git a/tests/end_to_end/ppc-live-shift-carry/manual-out.c b/tests/end_to_end/ppc-live-shift-carry/manual-out.c
+new file mode 100644
+index 0000000..c21ceb4
+--- /dev/null
++++ b/tests/end_to_end/ppc-live-shift-carry/manual-out.c
+@@ -0,0 +1,9 @@
++void test(s32 value, Output *out, s32 scratch, u32 high) {
++    s32 temp_r5;
++    u32 temp_carry;
++
++    temp_r5 = value >> 2;
++    temp_carry = (((u32) value & 0x80000000U) != 0) && (((u32) value & 3U) != 0);
++    out->quotient = (s32) ((u32) temp_r5 + temp_carry);
++    out->next = (s32) (high + (u32) ((u32) ((u32) temp_r5 + temp_carry) < (u32) temp_r5));
++}
+diff --git a/tests/end_to_end/ppc-live-shift-carry/manual-flags.txt b/tests/end_to_end/ppc-live-shift-carry/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-live-shift-carry/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-scheduled-shift-carry/context.c b/tests/end_to_end/ppc-scheduled-shift-carry/context.c
+new file mode 100644
+index 0000000..101da0c
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-shift-carry/context.c
+@@ -0,0 +1 @@
++int test(int value, int *out);
+diff --git a/tests/end_to_end/ppc-scheduled-shift-carry/manual.s b/tests/end_to_end/ppc-scheduled-shift-carry/manual.s
+new file mode 100644
+index 0000000..be94661
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-shift-carry/manual.s
+@@ -0,0 +1,7 @@
++.global test
++test:
++srawi r5, r3, 2
++stw r5, 0(r4)
++addi r4, r4, 4
++addze r3, r5
++blr
+diff --git a/tests/end_to_end/ppc-scheduled-shift-carry/manual-out.c b/tests/end_to_end/ppc-scheduled-shift-carry/manual-out.c
+new file mode 100644
+index 0000000..946b862
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-shift-carry/manual-out.c
+@@ -0,0 +1,4 @@
++s32 test(s32 value, s32 *out) {
++    *out = value >> 2;
++    return value / 4;
++}
+diff --git a/tests/end_to_end/ppc-scheduled-shift-carry/manual-flags.txt b/tests/end_to_end/ppc-scheduled-shift-carry/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-shift-carry/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-zero-mask-live-carry/context.c b/tests/end_to_end/ppc-zero-mask-live-carry/context.c
+new file mode 100644
+index 0000000..175928c
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask-live-carry/context.c
+@@ -0,0 +1,2 @@
++typedef struct { int mask; unsigned int high; } Output;
++void test(Output *out, unsigned int value, unsigned int high);
+diff --git a/tests/end_to_end/ppc-zero-mask-live-carry/manual.s b/tests/end_to_end/ppc-zero-mask-live-carry/manual.s
+new file mode 100644
+index 0000000..a828ae6
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask-live-carry/manual.s
+@@ -0,0 +1,8 @@
++.global test
++test:
++addic r6, r4, -1
++subfe r4, r6, r6
++stw r4, 0(r3)
++addze r5, r5
++stw r5, 4(r3)
++blr
+diff --git a/tests/end_to_end/ppc-zero-mask-live-carry/manual-out.c b/tests/end_to_end/ppc-zero-mask-live-carry/manual-out.c
+new file mode 100644
+index 0000000..c19fef8
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask-live-carry/manual-out.c
+@@ -0,0 +1,9 @@
++void test(Output *out, u32 value, u32 high) {
++    s32 temp_carry;
++    u32 temp_r6;
++
++    temp_r6 = value - 1;
++    temp_carry = (u32) (value - 1U) < value;
++    out->mask = (s32) ((u32) (temp_r6 - temp_r6) - (u32) !temp_carry);
++    out->high = high + (u32) ((temp_r6 > temp_r6) || ((temp_r6 == temp_r6) && temp_carry));
++}
+diff --git a/tests/end_to_end/ppc-zero-mask-live-carry/manual-flags.txt b/tests/end_to_end/ppc-zero-mask-live-carry/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-zero-mask-live-carry/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-shift31-carry/manual-out.c b/tests/end_to_end/ppc-shift31-carry/manual-out.c
+new file mode 100644
+index 0000000..371df1b
+--- /dev/null
++++ b/tests/end_to_end/ppc-shift31-carry/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(s32 value) {
++    return (s32) ((u32) (value >> 0x1F) + (u32) ((((u32) value & 0x80000000U) != 0) && (((u32) value & 0x7FFFFFFFU) != 0)));
++}
+diff --git a/tests/end_to_end/ppc-shift31-carry/manual-flags.txt b/tests/end_to_end/ppc-shift31-carry/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-shift31-carry/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-shift31-carry/context.c b/tests/end_to_end/ppc-shift31-carry/context.c
+new file mode 100644
+index 0000000..3b729ee
+--- /dev/null
++++ b/tests/end_to_end/ppc-shift31-carry/context.c
+@@ -0,0 +1 @@
++int test(int value);
+diff --git a/tests/end_to_end/ppc-shift31-carry/manual.s b/tests/end_to_end/ppc-shift31-carry/manual.s
+new file mode 100644
+index 0000000..73ecc7b
+--- /dev/null
++++ b/tests/end_to_end/ppc-shift31-carry/manual.s
+@@ -0,0 +1,5 @@
++.global test
++test:
++srawi r4, r3, 31
++addze r3, r4
++blr
+diff --git a/tests/unit/test_ppc_carry.py b/tests/unit/test_ppc_carry.py
+new file mode 100644
+index 0000000..1babe0e
+--- /dev/null
++++ b/tests/unit/test_ppc_carry.py
+@@ -0,0 +1,124 @@
++import operator
++import random
++import unittest
++from unittest.mock import Mock
++
++from m2c.arch_ppc import PPC_CARRY_INPUT, PPC_CARRY_OUTPUT, PpcArch, ppc_carry_result
++from m2c.asm_instruction import AsmLiteral, Register
++from m2c.instruction import InstructionMeta
++from m2c.translate import BinaryOp, Cast, Literal, UnaryOp
++from m2c.types import Type
++
++MASK = (1 << 32) - 1
++
++
++def evaluate(expr):
++    if isinstance(expr, Literal):
++        value = expr.value
++    elif isinstance(expr, Cast):
++        value = evaluate(expr.expr)
++    elif isinstance(expr, UnaryOp):
++        value = {"!": lambda v: int(not v), "-": operator.neg}[expr.op](evaluate(expr.expr))
++    elif isinstance(expr, BinaryOp):
++        ops = {"+": operator.add, "-": operator.sub, "&": operator.and_,
++               "<": operator.lt, ">": operator.gt, "==": operator.eq,
++               ">=": operator.ge, "!=": operator.ne, ">>": operator.rshift,
++               "&&": lambda a, b: bool(a and b), "||": lambda a, b: bool(a or b)}
++        value = int(ops[expr.op](evaluate(expr.left), evaluate(expr.right)))
++    else:
++        raise AssertionError(type(expr))
++    bits = expr.type.get_size_bits() or 32
++    if expr.type.is_signed() or expr.type.is_unsigned():
++        value &= (1 << bits) - 1
++        if expr.type.is_signed() and value & (1 << (bits - 1)):
++            value -= 1 << bits
++    return value
++
++
++def arguments(left, right, carry):
++    args = Mock()
++    args.reg.side_effect = lambda index: Literal(left if index == 1 else right, type=Type.u32())
++    args.regs = {Register("carry"): Literal(carry, type=Type.boolean())}
++    args.imm_value.return_value = right
++    args.s16_imm.return_value = Literal((right & 0x7FFF) - (right & 0x8000))
++    return args
++
++
++class TestPpcCarry(unittest.TestCase):
++    def test_arithmetic_matches_independent_wide_integer_oracle(self):
++        edges = [0, 1, 2, 0x7FFFFFFF, 0x80000000, MASK - 1, MASK]
++        rng = random.Random(0xCA)
++        pairs = [(a, b) for a in edges for b in edges]
++        pairs += [(rng.getrandbits(32), rng.getrandbits(32)) for _ in range(100)]
++        for mnemonic in PPC_CARRY_OUTPUT - {"srawi"}:
++            for left, right in pairs:
++                for incoming in (0, 1):
++                    operand = right
++                    if mnemonic in {"addic", "subfic"}:
++                        operand = ((right & 0x7FFF) - (right & 0x8000)) & MASK
++                    elif mnemonic in {"addze", "subfze"}:
++                        operand = 0
++                    elif mnemonic in {"addme", "subfme"}:
++                        operand = MASK
++                    carry_in = incoming if mnemonic in PPC_CARRY_INPUT else int(mnemonic.startswith("sub"))
++                    wide = ((~left & MASK) if mnemonic.startswith("sub") else left) + operand + carry_in
++                    result, carry = ppc_carry_result(mnemonic, arguments(left, right, incoming))
++                    with self.subTest(op=mnemonic, a=left, b=right, ca=incoming):
++                        self.assertEqual(evaluate(result) & MASK, wide & MASK)
++                        self.assertEqual(evaluate(carry), int(wide > MASK))
++
++    def test_arithmetic_shift_carry_requires_negative_and_discarded_bits(self):
++        for left in [0, 1, 0x7FFFFFFF, 0x80000000, 0x80000001, MASK - 1, MASK]:
++            for shift in range(32):
++                result, carry = ppc_carry_result("srawi", arguments(left, shift, 0))
++                signed = left if left < 1 << 31 else left - (1 << 32)
++                with self.subTest(a=left, shift=shift):
++                    self.assertEqual(evaluate(result) & MASK, (signed >> shift) & MASK)
++                    self.assertEqual(evaluate(carry), int(signed < 0 and bool(left & ((1 << shift) - 1))))
++
++    def test_zero_mask_matches_addic_self_subfe(self):
++        for value in [0, 1, 2, 0x7FFFFFFF, 0x80000000, MASK - 1, MASK]:
++            args = Mock()
++            args.reg.return_value = Literal(value, type=Type.u32())
++            expr = PpcArch.instrs_dest_first_non_load["cmpzero.mask.fictive"](args)
++            wide = value + MASK
++            expected = -int(not (wide > MASK))
++            self.assertEqual(evaluate(expr), expected)
++
++    def test_carry_is_a_real_input_output_and_call_clobber(self):
++        for mnemonic in PPC_CARRY_OUTPUT:
++            raw = [Register("r3"), Register("r4")]
++            if mnemonic not in {"addme", "addze", "subfme", "subfze"}:
++                raw.append(AsmLiteral(1) if mnemonic in {"srawi", "addic", "subfic"} else Register("r5"))
++            for suffix in ("", "."):
++                instr = PpcArch.parse(mnemonic + suffix, raw, InstructionMeta.missing())
++                self.assertIn(Register("carry"), instr.outputs)
++                self.assertEqual(Register("carry") in instr.inputs, mnemonic in PPC_CARRY_INPUT)
++        self.assertIn(Register("carry"), PpcArch.temp_regs)
++        self.assertNotIn(Register("carry"), PpcArch.saved_regs)
++
++    def test_extended_chain_reads_original_operands_before_aliasing_write(self):
++        regs = {Register("r3"): Literal(MASK), Register("r4"): Literal(1),
++                Register("r5"): Literal(MASK), Register("r6"): Literal(0)}
++        state = Mock()
++        def assign(reg, value):
++            regs[reg] = value
++            return value
++        state.set_reg.side_effect = assign
++        for mnemonic, raw in [("addc", ["r3", "r3", "r4"]),
++                              ("adde", ["r5", "r5", "r6"]),
++                              ("addze", ["r4", "r5"])]:
++            raw = [Register(reg) for reg in raw]
++            args = Mock()
++            args.stack_info.is_stack_reg.return_value = False
++            args.regs = regs
++            args.reg_ref.side_effect = lambda index: raw[index]
++            args.reg.side_effect = lambda index: regs[raw[index]]
++            PpcArch.parse(mnemonic, raw, InstructionMeta.missing()).eval_fn(state, args)
++        self.assertEqual(evaluate(regs[Register("r3")]) & MASK, 0)
++        self.assertEqual(evaluate(regs[Register("r5")]), 0)
++        self.assertEqual(evaluate(regs[Register("r4")]), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

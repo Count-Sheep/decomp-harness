@@ -1,0 +1,152 @@
+diff --git a/m2c/asm_file.py b/m2c/asm_file.py
+index 6f23305..0d8b994 100644
+--- a/m2c/asm_file.py
++++ b/m2c/asm_file.py
+@@ -708,7 +708,7 @@ def parse_file(f: typing.TextIO, arch: ArchAsm, options: Options) -> AsmFile:
+                         curr_section = ".rodata"
+                     elif curr_section == ".sdata":
+                         curr_section = ".data"
+-                    elif curr_section.startswith(".text"):
++                    elif curr_section.startswith(".text") or curr_section in (".init", ".fini"):
+                         curr_section = ".text"
+                 elif (
+                     directive == ".rdata"
+diff --git a/m2c/flow_graph.py b/m2c/flow_graph.py
+index 25c95ba..056c814 100644
+--- a/m2c/flow_graph.py
++++ b/m2c/flow_graph.py
+@@ -478,6 +478,15 @@ def build_blocks(
+     debug_patterns: bool,
+ ) -> List[Block]:
+     if not fragment:
++        if any(
++            isinstance(item, Instruction)
++            and isinstance(item.jump_target, JumpTarget)
++            and item.jump_target.target == function.name
++            for item in function.body
++        ) and not any(isinstance(item, Label) and function.name in item.names for item in function.body):
++            original = function
++            function = original.bodyless_copy()
++            function.body = [Label.new(function.name), *original.body]
+         if arch.has_delay_slots:
+             verify_no_trailing_delay_slot(function)
+ 
+diff --git a/tests/end_to_end/ppc-entry-self-branch/context.c b/tests/end_to_end/ppc-entry-self-branch/context.c
+new file mode 100644
+index 0000000..8315331
+--- /dev/null
++++ b/tests/end_to_end/ppc-entry-self-branch/context.c
+@@ -0,0 +1 @@
++int test(int ignored, int *value);
+diff --git a/tests/end_to_end/ppc-entry-self-branch/manual-flags.txt b/tests/end_to_end/ppc-entry-self-branch/manual-flags.txt
+new file mode 100644
+index 0000000..06b26e4
+--- /dev/null
++++ b/tests/end_to_end/ppc-entry-self-branch/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --globals=none
+diff --git a/tests/end_to_end/ppc-entry-self-branch/manual-out.c b/tests/end_to_end/ppc-entry-self-branch/manual-out.c
+new file mode 100644
+index 0000000..fa97621
+--- /dev/null
++++ b/tests/end_to_end/ppc-entry-self-branch/manual-out.c
+@@ -0,0 +1,8 @@
++s32 test(s32 ignored, s32 *value) {
++    s32 temp_r3;
++
++    do {
++        temp_r3 = *value;
++    } while (temp_r3 == 0);
++    return temp_r3;
++}
+diff --git a/tests/end_to_end/ppc-entry-self-branch/manual.s b/tests/end_to_end/ppc-entry-self-branch/manual.s
+new file mode 100644
+index 0000000..6585979
+--- /dev/null
++++ b/tests/end_to_end/ppc-entry-self-branch/manual.s
+@@ -0,0 +1,7 @@
++.text
++.fn test, global
++lwz r3, 0(r4)
++cmpwi r3, 0
++beq test
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-fini-section/context.c b/tests/end_to_end/ppc-fini-section/context.c
+new file mode 100644
+index 0000000..53f8d8e
+--- /dev/null
++++ b/tests/end_to_end/ppc-fini-section/context.c
+@@ -0,0 +1 @@
++int test(void);
+diff --git a/tests/end_to_end/ppc-fini-section/manual-flags.txt b/tests/end_to_end/ppc-fini-section/manual-flags.txt
+new file mode 100644
+index 0000000..06b26e4
+--- /dev/null
++++ b/tests/end_to_end/ppc-fini-section/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --globals=none
+diff --git a/tests/end_to_end/ppc-fini-section/manual-out.c b/tests/end_to_end/ppc-fini-section/manual-out.c
+new file mode 100644
+index 0000000..fe5e78f
+--- /dev/null
++++ b/tests/end_to_end/ppc-fini-section/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(void) {
++    return 9;
++}
+diff --git a/tests/end_to_end/ppc-fini-section/manual.s b/tests/end_to_end/ppc-fini-section/manual.s
+new file mode 100644
+index 0000000..4740c99
+--- /dev/null
++++ b/tests/end_to_end/ppc-fini-section/manual.s
+@@ -0,0 +1,5 @@
++.section .fini, "ax"
++.fn test, local
++li r3, 9
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-init-section/context.c b/tests/end_to_end/ppc-init-section/context.c
+new file mode 100644
+index 0000000..53f8d8e
+--- /dev/null
++++ b/tests/end_to_end/ppc-init-section/context.c
+@@ -0,0 +1 @@
++int test(void);
+diff --git a/tests/end_to_end/ppc-init-section/manual-flags.txt b/tests/end_to_end/ppc-init-section/manual-flags.txt
+new file mode 100644
+index 0000000..06b26e4
+--- /dev/null
++++ b/tests/end_to_end/ppc-init-section/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --globals=none
+diff --git a/tests/end_to_end/ppc-init-section/manual-out.c b/tests/end_to_end/ppc-init-section/manual-out.c
+new file mode 100644
+index 0000000..0f48d6d
+--- /dev/null
++++ b/tests/end_to_end/ppc-init-section/manual-out.c
+@@ -0,0 +1,3 @@
++s32 test(void) {
++    return 7;
++}
+diff --git a/tests/end_to_end/ppc-init-section/manual.s b/tests/end_to_end/ppc-init-section/manual.s
+new file mode 100644
+index 0000000..01c9303
+--- /dev/null
++++ b/tests/end_to_end/ppc-init-section/manual.s
+@@ -0,0 +1,5 @@
++.section .init, "ax"
++.fn test, local
++li r3, 7
++blr
++.endfn test
+diff --git a/tests/end_to_end/unreachable-return/mwcc-o4p-out.c b/tests/end_to_end/unreachable-return/mwcc-o4p-out.c
+index e6d26a4..8b1d6dc 100644
+--- a/tests/end_to_end/unreachable-return/mwcc-o4p-out.c
++++ b/tests/end_to_end/unreachable-return/mwcc-o4p-out.c
+@@ -1,3 +1,4 @@
+ void test(void) {
+-    test();
++loop_0:
++    goto loop_0;
+ }

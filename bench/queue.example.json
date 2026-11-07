@@ -1,0 +1,23 @@
+{
+  "_about": "Model benchmark queue for local_campaign_bench.py queue. Copy to bench/queue.local.json and edit. host is any OpenAI-compatible endpoint (llama-server, Ollama, vLLM...). server_cmd is optional: a shell command that (re)starts the server on {model}, with {extra} replaced by the entry's server_extra; leave it empty when the server is already running. pre_cmd is optional and runs before each entry (e.g. to make sure a tunnel is open).",
+  "host": "http://127.0.0.1:8080/v1",
+  "server_cmd": "",
+  "pre_cmd": "",
+  "server_wait": 1200,
+  "force": false,
+  "configs": [
+    {
+      "name": "example-model-no-think",
+      "model": "example-model",
+      "args": ["--think", "off", "--temperature", "0.7",
+               "--sampling", "{\"top_p\": 0.8, \"top_k\": 20, \"min_p\": 0}"]
+    },
+    {
+      "name": "example-model-think",
+      "model": "example-model",
+      "server_extra": "--reasoning-budget 2048",
+      "args": ["--think", "on", "--reasoning-tokens", "2048", "--temperature", "0.6",
+               "--sampling", "{\"top_p\": 0.95, \"top_k\": 20, \"min_p\": 0}"]
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+diff --git a/m2c/main.py b/m2c/main.py
+index 6090fc2..656d611 100644
+--- a/m2c/main.py
++++ b/m2c/main.py
+@@ -217,6 +217,7 @@ def run(options: Options) -> int:
+         deterministic_vars=options.deterministic_vars,
+         stack_spill_detection=options.stack_spill_detection,
+         mwcc_fused_subtract=options.mwcc_fused_subtract,
++        ppc_stack_storage=options.ppc_stack_storage,
+     )
+ 
+     decompilations: List[DecompilationState] = []
+@@ -605,6 +606,10 @@ def parse_flags(flags: List[str]) -> Options:
+         help="Matching variant: emit negative fused subtraction as c-a*b. "
+         "Requires MWCC codegen verification; not a general IEEE-equivalent rewrite.",
+     )
++    group.add_argument(
++        "--ppc-stack-storage", action="store_true",
++        help="Matching variant: preserve bounded PPC local stack storage as typed memory views.",
++    )
+     group.add_argument(
+         "--descending-regs",
+         dest="descending_regs",
+@@ -831,6 +836,7 @@ def parse_flags(flags: List[str]) -> Options:
+         incbin_dirs=args.incbin_dirs,
+         deterministic_vars=args.deterministic_vars,
+         mwcc_fused_subtract=args.mwcc_fused_subtract,
++        ppc_stack_storage=args.ppc_stack_storage,
+         descending_regs=args.descending_regs,
+         backwards_bss=args.backwards_bss,
+         disable_gc=args.disable_gc,
+diff --git a/m2c/options.py b/m2c/options.py
+index 267d8a6..557df10 100644
+--- a/m2c/options.py
++++ b/m2c/options.py
+@@ -201,6 +201,7 @@ class Options:
+     union_field_overrides: Dict[str, str]
+     explicit_field_access: bool = False
+     mwcc_fused_subtract: bool = False
++    ppc_stack_storage: bool = False
+ 
+     def formatter(self) -> Formatter:
+         return Formatter(
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 1ca78d0..824280c 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -487,10 +487,10 @@ class StackInfo:
+                     width = end - start
+                     view = self.global_info.typepool.get_or_create_struct_by_tag_name(tag, None, size=width)
+                     view.is_union = True
+-                    view.align = width
++                    view.align = width if width <= 8 else min(8, (start | width) & -(start | width))
+                     if not view.fields:
+                         for bits in (8, 16, 32, 64):
+-                            if bits // 8 > width:
++                            if bits // 8 > view.align:
+                                 continue
+                             for sign in ("u", "s"):
+                                 element = Type.int_of_size(bits)
+@@ -498,7 +498,7 @@ class StackInfo:
+                                 view.fields.append(StructDeclaration.StructField(
+                                     Type.array(element, width // (bits // 8)), 0, f"{sign}{bits}", False))
+                         for bits in (32, 64):
+-                            if bits // 8 <= width:
++                            if bits // 8 <= view.align:
+                                 element = Type.f32() if bits == 32 else Type.f64()
+                                 view.fields.append(StructDeclaration.StructField(
+                                     Type.array(element, width // (bits // 8)), 0, f"f{bits}", False))
+@@ -925,6 +925,17 @@ def get_stack_info(
+                     and not any(info.in_callee_save_reg_region(offset) for offset in range(start, end))
+                     and not info.in_subroutine_arg_region(start)):
+                 accesses.add((start, end))
++    if global_info.ppc_stack_storage and global_info.arch.arch == Target.ArchEnum.PPC and accesses:
++        # Preserve the machine's local storage, excluding the ABI header and saved registers.
++        end = info.callee_save_reg_region[0] or info.allocated_stack_size
++        start = 8
++        if end > start and all(start <= lo < hi <= end for lo, hi in accesses):
++            alignment = min(8, (start | (end - start)) & -(start | (end - start)))
++            if any(hi - lo > alignment or (lo - start) % (hi - lo) for lo, hi in accesses):
++                raise DecompFailure("PPC stack storage has unsupported alignment")
++            info.stack_memory_views.append((start, end, f"{stack_struct_name}_storage"))
++            return info
++
+     groups: List[List[Tuple[int, int]]] = []
+     for access in sorted(accesses):
+         if groups and access[0] < max(end for _, end in groups[-1]):
+@@ -4437,6 +4448,7 @@ class GlobalInfo:
+     deterministic_vars: bool
+     stack_spill_detection: bool
+     mwcc_fused_subtract: bool = False
++    ppc_stack_storage: bool = False
+     global_symbol_map: Dict[str, GlobalSymbol] = field(default_factory=dict)
+     persistent_function_state: Dict[str, PersistentFunctionState] = field(
+         default_factory=lambda: defaultdict(PersistentFunctionState)
+diff --git a/tests/unit/test_ppc_stack_storage.py b/tests/unit/test_ppc_stack_storage.py
+new file mode 100644
+index 0000000..c0fc034
+--- /dev/null
++++ b/tests/unit/test_ppc_stack_storage.py
+@@ -0,0 +1,74 @@
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++BODY = """stwu r1,-32(r1)
++mflr r0
++stw r0,36(r1)
++stw r31,28(r1)
++addi r3,r1,8
++bl fill
++lwz r3,8(r1)
++lwz r4,12(r1)
++add r3,r3,r4
++lwz r31,28(r1)
++lwz r0,36(r1)
++mtlr r0
++addi r1,r1,32
++blr"""
++
++
++class TestPpcStackStorage(unittest.TestCase):
++    def translate(self, enabled=True, body=BODY):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            (root / "target.s").write_text(".fn test, global\n" + body + "\n.endfn test\n")
++            (root / "context.c").write_text("int test(void); void fill(void *);")
++            flags = ["-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache", "--globals", "used-context",
++                     "--context", str(root / "context.c"), str(root / "target.s")]
++            if enabled:
++                flags.append("--ppc-stack-storage")
++            return decompile_and_capture_output(parse_flags(flags))
++
++    def test_address_exposed_stack_uses_one_bounded_region(self):
++        code = self.translate()
++        self.assertIn("union _m2c_stack_test_storage sp8;", code)
++        self.assertIn("u8[0x14]", code)
++        self.assertIn("sp8.u32[0]", code)
++        self.assertIn("sp8.u32[1]", code)
++        self.assertNotIn("u64[", code)
++        self.assertNotIn("spC", code)
++        self.assertNotIn("_storage", self.translate(enabled=False))
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for raw C syntax checks")
++    def test_raw_generated_storage_compiles_without_missing_locals(self):
++        code = self.translate()
++        with tempfile.TemporaryDirectory() as directory:
++            source = Path(directory) / "draft.c"
++            source.write_text("typedef unsigned char u8; typedef signed char s8;\n"
++                              "typedef unsigned short u16; typedef short s16;\n"
++                              "typedef unsigned int u32; typedef int s32; typedef float f32;\n" + code)
++            result = subprocess.run([shutil.which("clang"), "-target", "powerpc-unknown-none",
++                                     "-std=c89", "-fsyntax-only", "-Werror", str(source)],
++                                    capture_output=True, text=True, timeout=30)
++            self.assertEqual(result.returncode, 0, code + result.stderr)
++
++    def test_mixed_access_widths_keep_byte_offsets_and_signedness(self):
++        code = self.translate(body=BODY.replace("lwz r3,8(r1)", "lha r3,10(r1)")
++                                      .replace("lwz r4,12(r1)", "lbz r4,9(r1)"))
++        self.assertIn("sp8.s16[1]", code)
++        self.assertIn("sp8.u8[1]", code)
++
++    def test_unsupported_alignment_does_not_extend_into_saved_registers(self):
++        code = self.translate(body=BODY.replace("lwz r3,8(r1)", "lfd f1,8(r1)"))
++        self.assertIn("PPC stack storage has unsupported alignment", code)
++
++
++if __name__ == "__main__":
++    unittest.main()

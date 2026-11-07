@@ -1,0 +1,17 @@
+# Per-machine configuration: project roots, hosts, tool paths. Never commit it.
+harness.local.json
+dashboard.local.json
+bench/*.local.json
+.env
+.env.*
+
+# Local state: m2c checkout, reference corpora, caches. Per-project state lives in each project's build/.
+build/
+.cache/
+.venv/
+venv/
+
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db

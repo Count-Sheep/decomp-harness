@@ -1,0 +1,144 @@
+diff --git a/m2c/flow_graph.py b/m2c/flow_graph.py
+index 056c814..55e5edb 100644
+--- a/m2c/flow_graph.py
++++ b/m2c/flow_graph.py
+@@ -960,6 +960,20 @@ def build_graph_from_block(
+                 return block
+         return None
+ 
++    def is_local_case_table(name: str) -> bool:
++        entry = asm_data.values.get(name)
++        if entry is None:
++            return False
++        count = 0
++        for item in entry.data:
++            if isinstance(item, bytes):
++                break
++            label = item.as_symbol_without_addend()
++            if label is None or find_block_by_label(label) is None:
++                return False
++            count += 1
++        return count >= 2
++
+     # Extract branching instructions from this block.
+     jumps: List[Instruction] = [inst for inst in block.instructions if inst.is_jump()]
+     assert len(jumps) in [0, 1], "too many jump instructions in one block"
+@@ -1001,9 +1015,12 @@ def build_graph_from_block(
+                             isinstance(arg, Macro)
+                             and arg.macro_name in ("lo", "l")
+                             and isinstance(arg.argument, AsmGlobalSymbol)
+-                            and any(
+-                                arg.argument.symbol_name.startswith(prefix)
+-                                for prefix in ("jtbl", "jpt_", "lbl_", "jumptable_")
++                            and (
++                                any(
++                                    arg.argument.symbol_name.startswith(prefix)
++                                    for prefix in ("jtbl", "jpt_", "lbl_", "jumptable_")
++                                )
++                                or is_local_case_table(arg.argument.symbol_name)
+                             )
+                         ):
+                             jtbl_names.add(arg.argument.symbol_name)
+diff --git a/tests/unit/test_switch_tables.py b/tests/unit/test_switch_tables.py
+new file mode 100644
+index 0000000..2f15343
+--- /dev/null
++++ b/tests/unit/test_switch_tables.py
+@@ -0,0 +1,43 @@
++import io
++from pathlib import Path
++import unittest
++
++from m2c.arch_ppc import PpcArch
++from m2c.asm_file import parse_file
++from m2c.error import DecompFailure
++from m2c.flow_graph import SwitchNode, build_flowgraph
++from m2c.main import parse_flags
++
++
++class TestAnonymousSwitchTables(unittest.TestCase):
++    def graph(self, assembly):
++        arch = PpcArch()
++        options = parse_flags(['--target', 'ppc-mwcc-c', '-'])
++        stream = io.StringIO(assembly)
++        stream.name = 'anonymous-switch.s'
++        parsed = parse_file(stream, arch, options)
++        return build_flowgraph(parsed.functions[0], parsed.asm_data, arch, fragment=False)
++
++    def assembly(self):
++        fixture = Path(__file__).parents[1] / 'end_to_end/ppc-anonymous-switch/manual.s'
++        return fixture.read_text()
++
++    def test_real_local_case_addresses_do_not_require_a_name_prefix(self):
++        graph = self.graph(self.assembly())
++        switches = [node for node in graph.nodes if isinstance(node, SwitchNode)]
++        self.assertEqual(len(switches), 1)
++        self.assertEqual(len(switches[0].cases), 2)
++
++    def test_foreign_function_pointer_is_not_a_switch_case(self):
++        assembly = self.assembly().replace('.4byte .L_one', '.4byte other_function')
++        with self.assertRaisesRegex(DecompFailure, 'Unable to determine jump table'):
++            self.graph(assembly)
++
++    def test_numeric_data_is_not_a_switch_table(self):
++        assembly = self.assembly().replace('.4byte .L_zero', '.4byte 0').replace('.4byte .L_one', '.4byte 4')
++        with self.assertRaisesRegex(DecompFailure, 'Unable to determine jump table'):
++            self.graph(assembly)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/end_to_end/ppc-anonymous-switch/manual.s b/tests/end_to_end/ppc-anonymous-switch/manual.s
+new file mode 100644
+index 0000000..0e53b1a
+--- /dev/null
++++ b/tests/end_to_end/ppc-anonymous-switch/manual.s
+@@ -0,0 +1,25 @@
++.text
++.fn test, global
++cmplwi r3, 1
++bgt .L_default
++lis r4, "@87_switch"@ha
++addi r4, r4, "@87_switch"@l
++slwi r0, r3, 2
++lwzx r0, r4, r0
++mtctr r0
++bctr
++.L_zero:
++li r3, 7
++blr
++.L_one:
++li r3, 11
++blr
++.L_default:
++li r3, 13
++blr
++.endfn test
++.data
++.obj "@87_switch", global
++.4byte .L_zero
++.4byte .L_one
++.endobj "@87_switch"
+diff --git a/tests/end_to_end/ppc-anonymous-switch/manual-flags.txt b/tests/end_to_end/ppc-anonymous-switch/manual-flags.txt
+new file mode 100644
+index 0000000..4b6bad7
+--- /dev/null
++++ b/tests/end_to_end/ppc-anonymous-switch/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c
+diff --git a/tests/end_to_end/ppc-anonymous-switch/manual-out.c b/tests/end_to_end/ppc-anonymous-switch/manual-out.c
+new file mode 100644
+index 0000000..78dfc97
+--- /dev/null
++++ b/tests/end_to_end/ppc-anonymous-switch/manual-out.c
+@@ -0,0 +1,10 @@
++s32 test(u32 arg0) {
++    switch (arg0) {
++    case 0:
++        return 7;
++    case 1:
++        return 0xB;
++    default:
++        return 0xD;
++    }
++}

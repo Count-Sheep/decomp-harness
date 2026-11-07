@@ -1,0 +1,404 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+index d9171c4..e5552ae 100644
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -11,6 +11,7 @@ from typing import (
+ )
+ 
+ from .error import DecompFailure
++from .asm_file import Label
+ from .ir_pattern import IrMatch, IrPattern
+ from .options import Target
+ from .asm_instruction import (
+@@ -25,6 +26,7 @@ from .asm_instruction import (
+     Macro,
+     Register,
+     get_jump_target,
++    traverse_arg,
+ )
+ from .instruction import (
+     Instruction,
+@@ -150,28 +152,71 @@ class MfcrPattern(SimpleAsmPattern):
+ 
+ class TailCallPattern(AsmPattern):
+     """
+-    If a function ends in `return fn(...);` then the compiler may perform tail-call
+-    optimization. This is emitted as `b fn` instead of using `bl fn; blr`.
++    External branches are tail exits, including conditional and non-final exits.
++    Represent the taken path as a call followed by return for C translation.
+     """
+ 
+     def match(self, matcher: AsmMatcher) -> Optional[Replacement]:
+-        if matcher.index != len(matcher.input) - 1:
++        instr = matcher.input[matcher.index]
++        inverses = {
++            "beq": "bne", "bne": "beq", "bge": "blt", "blt": "bge",
++            "bgt": "ble", "ble": "bgt", "bns": "bso", "bso": "bns",
++        }
++        if not isinstance(instr, Instruction) or instr.mnemonic not in {"b", *inverses}:
++            return None
++        target = instr.args[-1]
++        if not isinstance(target, AsmGlobalSymbol) or matcher.is_local_label(target.symbol_name):
+             return None
++        if target.symbol_name.startswith("."):
++            return None
++        body = [AsmInstruction("bl", [target]), AsmInstruction("blr", [])]
++        if instr.mnemonic == "b":
++            return Replacement(body, 1)
++        label = f"._m2c_tail_{matcher.index}"
++        while label in matcher.labels:
++            label += "_"
++        return Replacement([
++            AsmInstruction(inverses[instr.mnemonic], [*instr.args[:-1], AsmGlobalSymbol(label)]),
++            *body,
++            Label.new(label),
++        ], 1)
++
++
++class ContextTransferPattern(AsmPattern):
++    """Retain non-C stack-switch exits as explicit unsupported transfers."""
++
++    def match(self, matcher: AsmMatcher) -> Optional[Replacement]:
+         instr = matcher.input[matcher.index]
+-        if (
+-            isinstance(instr, Instruction)
+-            and instr.mnemonic == "b"
+-            and isinstance(instr.args[0], AsmGlobalSymbol)
+-            and not matcher.is_local_label(instr.args[0].symbol_name)
+-        ):
+-            return Replacement(
+-                [
+-                    AsmInstruction("bl", instr.args),
+-                    AsmInstruction("blr", []),
+-                ],
+-                1,
+-            )
+-        return None
++        if matcher.index != len(matcher.input) - 1 or not isinstance(instr, Instruction):
++            return None
++        if instr.mnemonic != "bctr":
++            return None
++        for table in matcher.asm_data.values.values():
++            if any(not isinstance(entry, bytes) and entry.as_symbol_without_addend() in matcher.labels
++                   for entry in table.data):
++                return None
++        for item in matcher.input:
++            if not isinstance(item, Instruction):
++                continue
++            if item.mnemonic in ("lwzx", "lwzux"):
++                return None
++            for arg in item.args:
++                if any(isinstance(part, AsmGlobalSymbol) and
++                       part.symbol_name.startswith(("jumptable_", "jtbl", "jpt_"))
++                       for part in traverse_arg(arg)):
++                    return None
++        switches_stack = any(
++            isinstance(item, Instruction) and item.mnemonic == "lwz"
++            and item.args[0] == Register("r1")
++            and isinstance(item.args[1], AsmAddressMode)
++            and item.args[1].base != Register("r1")
++            for item in matcher.input
++        )
++        restores_lr = any(isinstance(item, Instruction) and item.mnemonic == "mtlr"
++                          for item in matcher.input)
++        if not switches_stack or not restores_lr:
++            return None
++        return Replacement([AsmInstruction("bctr.context_transfer", [])], 1)
+ 
+ 
+ class SaveRestoreRegsFnPattern(AsmPattern):
+@@ -1046,6 +1091,7 @@ class PpcArch(Arch):
+         function_target: Optional[Argument] = None
+         is_conditional = False
+         is_return = False
++        is_noreturn = False
+         is_load = False
+         is_store = False
+         eval_fn: Optional[Callable[[NodeState, InstrArgs], object]] = None
+@@ -1117,6 +1163,16 @@ class PpcArch(Arch):
+             is_conditional = True
+             # NB: These are rewritten to mnemonic[:-2] by build_blocks in flow_graph.py
+             eval_fn = unreachable_eval
++        elif mnemonic == "bctr.context_transfer":
++            assert len(args) == 0
++            inputs = [Register("ctr"), Register("lr"), Register("r1")]
++            is_return = True
++            is_noreturn = True
++
++            def eval_fn(s: NodeState, a: InstrArgs) -> None:
++                s.write_statement(void_fn_op("M2C_UNRESOLVED_CONTEXT_TRANSFER",
++                                          [a.regs[reg] for reg in inputs]))
++
+         elif mnemonic == "bctr":
+             # Jump table (switch)
+             assert len(args) == 0
+@@ -1514,6 +1570,7 @@ class PpcArch(Arch):
+             function_target=function_target,
+             is_conditional=is_conditional,
+             is_return=is_return,
++            is_noreturn=is_noreturn,
+             is_load=is_load,
+             is_store=is_store,
+             eval_fn=eval_fn,
+@@ -1546,6 +1603,7 @@ class PpcArch(Arch):
+         FcmpoCrorPattern(),
+         MfcrPattern(),
+         TailCallPattern(),
++        ContextTransferPattern(),
+         SaveRestoreRegsFnPattern(),
+         LoopStructCopyPattern(),
+         BranchCtrPattern(),
+diff --git a/m2c/instruction.py b/m2c/instruction.py
+index c4fcaa6..22eb449 100644
+--- a/m2c/instruction.py
++++ b/m2c/instruction.py
+@@ -139,6 +139,7 @@ class Instruction:
+ 
+     # True if the Instruction was part of a matched IR pattern, but not elided
+     in_pattern: bool = False
++    is_noreturn: bool = False
+ 
+     def is_jump(self) -> bool:
+         return self.jump_target is not None or self.is_return
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 0bbddbb..24f6140 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -4228,7 +4228,7 @@ def translate_all_blocks(
+         block_info = translate_block(state, options)
+         node = state.node
+         node.block.add_block_info(block_info)
+-        if isinstance(node, ReturnNode):
++        if isinstance(node, ReturnNode) and not any(instr.is_noreturn for instr in node.block.instructions):
+             return_blocks.append(block_info)
+         # Add children to the translation queue in reverse order, to get a normally
+         # ordered pre-order traversal. (Doesn't affect the result majorly but it's
+diff --git a/tests/unit/test_tail_calls.py b/tests/unit/test_tail_calls.py
+new file mode 100644
+index 0000000..1704542
+--- /dev/null
++++ b/tests/unit/test_tail_calls.py
+@@ -0,0 +1,99 @@
++import unittest
++from pathlib import Path
++
++from m2c.arch_ppc import ContextTransferPattern, PpcArch, TailCallPattern
++from m2c.asm_file import AsmData, AsmDataEntry, AsmSymbolicData, Label
++from m2c.asm_instruction import AsmAddressMode, AsmGlobalSymbol, AsmLiteral, Register
++from m2c.asm_pattern import AsmMatcher
++from m2c.instruction import InstructionMeta
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestPpcTailCalls(unittest.TestCase):
++    def match(self, mnemonic, args, labels=()):
++        arch = PpcArch()
++        instruction = arch.parse(mnemonic, args, InstructionMeta.missing())
++        trailing = arch.parse('blr', [], InstructionMeta.missing())
++        matcher = AsmMatcher(arch, AsmData(), [instruction, trailing], set(labels))
++        return TailCallPattern().match(matcher)
++
++    def test_unconditional_exit_is_recognized_before_trailing_instructions(self):
++        result = self.match('b', [AsmGlobalSymbol('helper')])
++        self.assertEqual([item.mnemonic for item in result.new_body], ['bl', 'blr'])
++        self.assertEqual(result.num_consumed, 1)
++
++    def test_conditional_exit_preserves_nondefault_condition_field(self):
++        result = self.match('bne', [Register('cr3'), AsmGlobalSymbol('helper')])
++        branch, call, ret, label = result.new_body
++        self.assertEqual(branch.mnemonic, 'beq')
++        self.assertEqual(branch.args[0], Register('cr3'))
++        self.assertEqual(branch.args[-1], AsmGlobalSymbol(label.names[0]))
++        self.assertEqual(call.args, [AsmGlobalSymbol('helper')])
++        self.assertEqual(ret.mnemonic, 'blr')
++
++    def test_conditional_exit_avoids_existing_label_collision(self):
++        result = self.match('beq', [AsmGlobalSymbol('helper')], ['._m2c_tail_0'])
++        self.assertEqual(result.new_body[-1], Label.new('._m2c_tail_0_'))
++
++    def test_local_branch_and_missing_local_label_are_not_calls(self):
++        self.assertIsNone(self.match('b', [AsmGlobalSymbol('test')], ['test']))
++        self.assertIsNone(self.match('b', [AsmGlobalSymbol('.L_missing')]))
++        self.assertIsNone(self.match('bne', [AsmGlobalSymbol('.L_missing')]))
++
++    def test_counter_branch_is_not_reinterpreted_as_condition_register_branch(self):
++        self.assertIsNone(self.match('bdnz', [AsmGlobalSymbol('helper')]))
++
++
++class TestContextTransfers(unittest.TestCase):
++    def match(self, base, restore_lr=True, trailing=False, case_table=False, indexed_load=False):
++        arch = PpcArch()
++        meta = InstructionMeta.missing()
++        body = [arch.parse('lwz', [Register('r1'), AsmAddressMode(Register(base), AsmLiteral(8), None)], meta)]
++        if indexed_load:
++            body.append(arch.parse('lwzx', [Register('r0'), Register('r3'), Register('r4')], meta))
++        if restore_lr:
++            body.append(arch.parse('mtlr', [Register('r0')], meta))
++        body.append(arch.parse('bctr', [], meta))
++        index = len(body) - 1
++        if trailing:
++            body.append(Label.new('.L_case'))
++        data = AsmData()
++        labels = set()
++        if case_table:
++            labels.add('.L_case')
++            data.values['table'] = AsmDataEntry(('test', 0), [AsmSymbolicData(AsmGlobalSymbol('.L_case'), 4)])
++        return ContextTransferPattern().match(AsmMatcher(arch, data, body, labels, index=index))
++
++    def test_foreign_stack_and_lr_transfer_is_retained_as_opaque_not_a_call(self):
++        result = self.match('r3')
++        self.assertEqual(result.new_body[0].mnemonic, 'bctr.context_transfer')
++        instruction = PpcArch.parse('bctr.context_transfer', [], InstructionMeta.missing())
++        self.assertTrue(instruction.is_return)
++        self.assertTrue(instruction.is_noreturn)
++        self.assertEqual(instruction.inputs, [Register('ctr'), Register('lr'), Register('r1')])
++
++    def test_ordinary_stack_restore_and_nonterminal_switch_stay_unchanged(self):
++        self.assertIsNone(self.match('r1'))
++        self.assertIsNone(self.match('r3', restore_lr=False))
++        self.assertIsNone(self.match('r3', trailing=True))
++
++    def test_local_case_table_is_not_hidden_by_opaque_transfer(self):
++        self.assertIsNone(self.match('r3', case_table=True))
++
++    def test_indexed_load_keeps_unknown_switch_table_diagnostic(self):
++        self.assertIsNone(self.match('r3', indexed_load=True))
++
++    def test_untyped_context_transfer_does_not_invent_a_return_value(self):
++        fixture = Path(__file__).parents[1] / 'end_to_end/ppc-context-transfer/manual.s'
++        options = parse_flags(['--target', 'ppc-mwcc-c', '--function', 'test',
++                               '--no-unk-inference', '--valid-syntax', str(fixture)])
++        output = decompile_and_capture_output(options)
++        self.assertIn('void test(', output)
++        self.assertIn('M2C_UNRESOLVED_CONTEXT_TRANSFER', output)
++        self.assertNotIn('return ', output)
++        self.assertIn('= ', output)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/end_to_end/ppc-conditional-tail/manual.s b/tests/end_to_end/ppc-conditional-tail/manual.s
+new file mode 100644
+index 0000000..0852594
+--- /dev/null
++++ b/tests/end_to_end/ppc-conditional-tail/manual.s
+@@ -0,0 +1,7 @@
++.text
++.fn test, global
++cmpwi cr3, r3, 0
++bne cr3, helper
++li r3, 7
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-conditional-tail/context.c b/tests/end_to_end/ppc-conditional-tail/context.c
+new file mode 100644
+index 0000000..8883898
+--- /dev/null
++++ b/tests/end_to_end/ppc-conditional-tail/context.c
+@@ -0,0 +1,2 @@
++int helper(int value);
++int test(int value);
+diff --git a/tests/end_to_end/ppc-conditional-tail/manual-flags.txt b/tests/end_to_end/ppc-conditional-tail/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-conditional-tail/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-conditional-tail/manual-out.c b/tests/end_to_end/ppc-conditional-tail/manual-out.c
+new file mode 100644
+index 0000000..128711b
+--- /dev/null
++++ b/tests/end_to_end/ppc-conditional-tail/manual-out.c
+@@ -0,0 +1,6 @@
++s32 test(s32 value) {
++    if (value != 0) {
++        return helper(value);
++    }
++    return 7;
++}
+diff --git a/tests/end_to_end/ppc-nonfinal-tail/manual.s b/tests/end_to_end/ppc-nonfinal-tail/manual.s
+new file mode 100644
+index 0000000..b58ac7d
+--- /dev/null
++++ b/tests/end_to_end/ppc-nonfinal-tail/manual.s
+@@ -0,0 +1,10 @@
++.text
++.fn test, global
++cmpwi r3, 0
++beq .L_other
++b helper
++blr
++.L_other:
++li r3, 9
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-nonfinal-tail/context.c b/tests/end_to_end/ppc-nonfinal-tail/context.c
+new file mode 100644
+index 0000000..8883898
+--- /dev/null
++++ b/tests/end_to_end/ppc-nonfinal-tail/context.c
+@@ -0,0 +1,2 @@
++int helper(int value);
++int test(int value);
+diff --git a/tests/end_to_end/ppc-nonfinal-tail/manual-flags.txt b/tests/end_to_end/ppc-nonfinal-tail/manual-flags.txt
+new file mode 100644
+index 0000000..fdf21e6
+--- /dev/null
++++ b/tests/end_to_end/ppc-nonfinal-tail/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c
+diff --git a/tests/end_to_end/ppc-nonfinal-tail/manual-out.c b/tests/end_to_end/ppc-nonfinal-tail/manual-out.c
+new file mode 100644
+index 0000000..f4c7c99
+--- /dev/null
++++ b/tests/end_to_end/ppc-nonfinal-tail/manual-out.c
+@@ -0,0 +1,6 @@
++s32 test(s32 value) {
++    if (value != 0) {
++        return helper(value);
++    }
++    return 9;
++}
+diff --git a/tests/end_to_end/ppc-context-transfer/manual.s b/tests/end_to_end/ppc-context-transfer/manual.s
+new file mode 100644
+index 0000000..b6b3781
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-transfer/manual.s
+@@ -0,0 +1,11 @@
++.text
++.fn test, global
++lwz r0, 0(r3)
++stw r0, 4(r3)
++lwz r1, 8(r3)
++lwz r0, 12(r3)
++mtlr r0
++lwz r0, 16(r3)
++mtctr r0
++bctr
++.endfn test
+diff --git a/tests/end_to_end/ppc-context-transfer/context.c b/tests/end_to_end/ppc-context-transfer/context.c
+new file mode 100644
+index 0000000..4c1aec6
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-transfer/context.c
+@@ -0,0 +1 @@
++void test(unsigned int *context);
+diff --git a/tests/end_to_end/ppc-context-transfer/manual-flags.txt b/tests/end_to_end/ppc-context-transfer/manual-flags.txt
+new file mode 100644
+index 0000000..007fcd1
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-transfer/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-context-transfer/manual-out.c b/tests/end_to_end/ppc-context-transfer/manual-out.c
+new file mode 100644
+index 0000000..20a2621
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-transfer/manual-out.c
+@@ -0,0 +1,4 @@
++void test(u32 *context) {
++    M2C_FIELD(context, u32 *, 4) = (u32) M2C_FIELD(context, u32 *, 0);
++    M2C_UNRESOLVED_CONTEXT_TRANSFER(M2C_FIELD(context, s32 *, 0x10), M2C_FIELD(context, s32 *, 0xC), M2C_FIELD(context, s32 *, 8));
++}

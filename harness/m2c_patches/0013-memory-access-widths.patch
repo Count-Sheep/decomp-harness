@@ -1,0 +1,329 @@
+diff --git a/m2c/evaluate.py b/m2c/evaluate.py
+index 4705d28..7e712dd 100644
+--- a/m2c/evaluate.py
++++ b/m2c/evaluate.py
+@@ -77,6 +77,7 @@ def deref(
+     *,
+     size: int,
+     store: bool = False,
++    memory_type: Optional[Type] = None,
+ ) -> Expression:
+     if isinstance(arg, Expression):
+         offset = 0
+@@ -138,9 +139,38 @@ def deref(
+         var, offset, stack_info, target_size=size, ptr=False
+     )
+     if array_expr is not None:
+-        return array_expr
++        array_size = array_expr.type.get_size_bytes()
++        if array_size is None and isinstance(array_expr, StructAccess):
++            array_target = array_expr.struct_var.type.get_pointer_target()
++            array_size = (
++                array_target.get_size_bytes() if array_target is not None else None
++            )
++        if memory_type is None or array_size is None or array_size == size:
++            return array_expr
++        if isinstance(array_expr, StructAccess):
++            var, offset = array_expr.struct_var, array_expr.offset
++        else:
++            var = AddressOf(array_expr, type=array_expr.type.reference())
++            offset = 0
+     field_path, field_type, _ = var.type.get_deref_field(offset, target_size=size)
+-    if field_path is not None:
++    declared_type = (
++        field_type if field_path is not None else var.type.get_pointer_target()
++    )
++    declared_size = declared_type.get_size_bytes() if declared_type is not None else None
++    if (
++        memory_type is not None
++        and offset == 0
++        and declared_size
++        and declared_size != size
++        and declared_type is not None
++        and not declared_type.is_struct()
++        and not declared_type.is_array()
++    ):
++        # Zero-offset simplification must not replace a memory access with a value cast.
++        var = as_type(var, Type.ptr(memory_type), silent=False, unify=False)
++        type = memory_type
++        field_path, _, _ = var.type.get_deref_field(offset, target_size=size)
++    elif field_path is not None:
+         field_type.unify(type)
+         type = field_type
+     else:
+@@ -481,7 +511,7 @@ def handle_load(args: InstrArgs, type: Type) -> Expression:
+     size = type.get_size_bytes()
+     assert size is not None
+     output_reg = args.reg_ref(0)
+-    expr = deref(args.memory_ref(1), args.regs, args.stack_info, size=size)
++    expr = deref(args.memory_ref(1), args.regs, args.stack_info, size=size, memory_type=type)
+ 
+     def load_rodata_constant() -> Optional[Expression]:
+         if not isinstance(expr, StructAccess):
+@@ -641,7 +671,9 @@ def make_store_real(
+     ):
+         # Elide register preserval.
+         return None
+-    dest = deref(target, regs, stack_info, size=size, store=True)
++    dest = deref(
++        target, regs, stack_info, size=size, store=True, memory_type=type
++    )
+     dest.type.unify(type)
+     return StoreStmt(source=as_type(source_val, type, silent=is_stack), dest=dest)
+ 
+@@ -655,7 +687,9 @@ def make_storex(args: InstrArgs, type: Type) -> Optional[StoreStmt]:
+     ptr = BinaryOp.intptr(left=args.reg(1), op="+", right=args.reg(2))
+ 
+     # TODO: Can we assume storex's are never used to save registers to the stack?
+-    dest = deref(ptr, args.regs, args.stack_info, size=size, store=True)
++    dest = deref(
++        ptr, args.regs, args.stack_info, size=size, store=True, memory_type=type
++    )
+     dest.type.unify(type)
+     return StoreStmt(source=as_type(source, type, silent=False), dest=dest)
+ 
+@@ -1461,7 +1495,7 @@ def handle_loadx(args: InstrArgs, type: Type) -> Expression:
+     assert size is not None
+ 
+     ptr = BinaryOp.intptr(left=args.reg(1), op="+", right=args.reg(2))
+-    expr = deref(ptr, args.regs, args.stack_info, size=size)
++    expr = deref(ptr, args.regs, args.stack_info, size=size, memory_type=type)
+     return as_type(expr, type, silent=True)
+ 
+ 
+diff --git a/tests/end_to_end/lwl/mwcc-o4p-out.c b/tests/end_to_end/lwl/mwcc-o4p-out.c
+index eab45c1..6718e14 100644
+--- a/tests/end_to_end/lwl/mwcc-o4p-out.c
++++ b/tests/end_to_end/lwl/mwcc-o4p-out.c
+@@ -11,13 +11,15 @@ void test(void) {
+     u8 spE;
+     u16 spC;
+     s32 sp8;
++    u16 temp_r4;
+ 
++    temp_r4 = *(u16 *) &$$22;
+     sp8 = $$22;
+-    spC = (u16) $$22;
+-    spE = (u8) $$22;
+-    foo(&sp8, (u16) $$22);
++    spC = temp_r4;
++    spE = *(u8 *) &$$22;
++    foo(&sp8, temp_r4);
+     a1.unk1 = (s32) a2.unk1;
+     a3 = a1.unk0;
+-    a3 = (u8) a1.unk0;
++    *(u8 *) &a3 = (u8) a1.unk0;
+     strcpy(&buf, &$$24, a1.unk0);
+ }
+diff --git a/tests/end_to_end/rlwimi/agbcc-o2-out.c b/tests/end_to_end/rlwimi/agbcc-o2-out.c
+index a22540c..a8abbc9 100644
+--- a/tests/end_to_end/rlwimi/agbcc-o2-out.c
++++ b/tests/end_to_end/rlwimi/agbcc-o2-out.c
+@@ -3,6 +3,6 @@ extern u8 y;
+ 
+ void test(void *arg0) {
+     x = (((((-2 & x) | (arg0->unk0 & 1)) & ~2) | ((arg0->unk1 & 1) * 2)) & ~0x7C) | ((arg0->unk2 & 0x1F) * 4);
+-    x = (s16) ((0xFFFFF07F & (u16) x) | ((arg0->unk3 & 0x1F) << 7));
++    *(s16 *) &x = (0xFFFFF07F & *(u16 *) &x) | ((arg0->unk3 & 0x1F) << 7);
+     y = (y | 1) & ~2;
+ }
+diff --git a/tests/end_to_end/rlwimi/mwcc-o4p-out.c b/tests/end_to_end/rlwimi/mwcc-o4p-out.c
+index 9b48dce..114cbda 100644
+--- a/tests/end_to_end/rlwimi/mwcc-o4p-out.c
++++ b/tests/end_to_end/rlwimi/mwcc-o4p-out.c
+@@ -6,6 +6,6 @@ void test(void *arg0) {
+     x = (x & ~0x40) | ((arg0->unk1 << 6) & 0x40);
+     x = (x & ~0x3E) | ((arg0->unk2 << 1) & 0x3E);
+     y |= 0x80;
+-    x = (s16) (((u16) x & ~0x1F0) | (((s8) arg0->unk3 << 4) & 0x1F0));
++    *(s16 *) &x = (*(u16 *) &x & ~0x1F0) | (((s8) arg0->unk3 << 4) & 0x1F0);
+     y &= ~0x40;
+ }
+diff --git a/tests/end_to_end/custom_stack/agbcc-o2-out.c b/tests/end_to_end/custom_stack/agbcc-o2-out.c
+index 3bd4709..fbd26e5 100644
+--- a/tests/end_to_end/custom_stack/agbcc-o2-out.c
++++ b/tests/end_to_end/custom_stack/agbcc-o2-out.c
+@@ -29,18 +29,18 @@ s32 test(void *arg0) {
+     frob(&sp0);
+     temp_r1 = arg0->unk0;
+     temp_r3 = arg0->unk4;
+-    spC = (u8) (temp_r1 + temp_r3);
++    *(s8 *) &spC = temp_r1 + temp_r3;
+     temp_r2 = arg0->unk8;
+     sp0.unkE = (s16) (temp_r1 + temp_r2);
+     temp_r5 = temp_r3 + temp_r2;
+     sp10 = temp_r5;
+-    sp0 = spC * temp_r1;
++    sp0 = *(u8 *) &spC * temp_r1;
+     sp4 = sp0.unkE * temp_r3;
+     sp8 = temp_r2 * temp_r5;
+-    if (spC != 0) {
++    if (*(u8 *) &spC != 0) {
+         sp14 = (s32) arg0;
+     } else {
+         sp14 = &sp0;
+     }
+-    return sp0.unkE + spC + sp10 + *sp14 + sp4;
++    return sp0.unkE + *(u8 *) &spC + sp10 + *sp14 + sp4;
+ }
+diff --git a/tests/end_to_end/custom_stack/irix-g-out.c b/tests/end_to_end/custom_stack/irix-g-out.c
+index 45163a2..241cdfe 100644
+--- a/tests/end_to_end/custom_stack/irix-g-out.c
++++ b/tests/end_to_end/custom_stack/irix-g-out.c
+@@ -40,5 +40,5 @@ s32 test(void *arg0) {
+     } else {
+         sp24 = &sp18;
+     }
+-    return sp2F + (s16) sp2C + (s32) sp28 + *sp24 + sp1C;
++    return sp2F + (s16) sp2C + (s32) sp28 + *(s32 *) sp24 + sp1C;
+ }
+diff --git a/tests/end_to_end/arrays/mwcc-o4p-out.c b/tests/end_to_end/arrays/mwcc-o4p-out.c
+index 9edf6b0..c66f6b4 100644
+--- a/tests/end_to_end/arrays/mwcc-o4p-out.c
++++ b/tests/end_to_end/arrays/mwcc-o4p-out.c
+@@ -8,6 +8,6 @@ s32 test(s32 arg0, s32 arg1, s32 arg2) {
+ 
+     temp_r10 = arg0 * 4;
+     sp14 = $$21;
+-    sp18 = (u16) $$21;
++    sp18 = *(u16 *) &$$21;
+     return globalArray[arg0] + (((s8) *((s32 *) ((char *) &sp14 + arg0)) * *(arg1 + temp_r10)) + (arg2 + temp_r10)->unk4);
+ }
+diff --git a/tests/end_to_end/void_pointers/agbcc-o2-out.c b/tests/end_to_end/void_pointers/agbcc-o2-out.c
+index 2b7a565..7d22e79 100644
+--- a/tests/end_to_end/void_pointers/agbcc-o2-out.c
++++ b/tests/end_to_end/void_pointers/agbcc-o2-out.c
+@@ -4,7 +4,7 @@ s32 test(s32 *x) {
+     s32 sp8;
+     s32 temp_r2;
+ 
+-    sp0 = x->unk0;
++    sp0 = *(u8 *) x;
+     sp4 = x + 0xA;
+     sp8 = x->unk190;
+     sp0 = *func_00400090(&sp0) + sp0;
+diff --git a/tests/unit/test_memory_widths.py b/tests/unit/test_memory_widths.py
+new file mode 100644
+index 0000000..27ce561
+--- /dev/null
++++ b/tests/unit/test_memory_widths.py
+@@ -0,0 +1,119 @@
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestMemoryWidths(unittest.TestCase):
++    def translate(self, instructions, context, *, native=True):
++        with tempfile.TemporaryDirectory() as name:
++            root = Path(name)
++            (root / "target.s").write_text(".fn test, global\n" + instructions + "\nblr\n.endfn test\n")
++            (root / "context.c").write_text(context)
++            flags = ["-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache", "--no-unk-inference",
++                     "--context", str(root / "context.c"), str(root / "target.s")]
++            if native:
++                flags.append("--explicit-field-access")
++            return decompile_and_capture_output(parse_flags(flags))
++
++    def test_word_load_from_byte_pointer_and_global_casts_address_not_value(self):
++        for native in (False, True):
++            pointer = self.translate("lwz r3,0(r3)", "unsigned int test(unsigned char *bytes);", native=native)
++            self.assertIn("*(u32 *) bytes", pointer)
++            self.assertNotIn("(u32) *bytes", pointer)
++            global_load = self.translate("lis r3,bytes@ha\nlwz r3,bytes@l(r3)",
++                                         "extern unsigned char bytes[]; unsigned int test(void);", native=native)
++            self.assertIn("*(u32 *) bytes", global_load)
++            self.assertNotIn("(u32) *bytes", global_load)
++
++    def test_signed_halfword_and_float_loads_preserve_instruction_type(self):
++        half = self.translate("lha r3,0(r3)", "short test(unsigned char *bytes);")
++        self.assertIn("*(s16 *) bytes", half)
++        single = self.translate("lfs f1,0(r3)", "float test(unsigned char *bytes);")
++        self.assertIn("*(f32 *) bytes", single)
++        double = self.translate("lfd f1,0(r3)", "double test(unsigned char *bytes);")
++        self.assertIn("*(f64 *) bytes", double)
++        self.assertNotIn("M2C_BITWISE", single + double)
++
++    def test_word_store_and_partial_word_store_use_memory_not_conversion(self):
++        word = self.translate("stw r4,0(r3)", "void test(unsigned char *bytes, unsigned int value);")
++        self.assertIn("*(u32 *) bytes", word)
++        byte = self.translate("stb r4,0(r3)", "void test(unsigned int *words, unsigned char value);")
++        self.assertIn("*(u8 *) words", byte)
++        self.assertNotIn("*words =", byte)
++
++    def test_matching_declarations_stay_in_their_original_source_form(self):
++        normal = self.translate("lwz r3,0(r3)", "unsigned int test(unsigned int *words);")
++        self.assertIn("return *words;", normal)
++        self.assertNotIn("(u32 *)", normal)
++        offset = self.translate("lwz r3,4(r3)", "unsigned int test(unsigned char *bytes);")
++        self.assertIn("(char *)(bytes)", offset)
++        self.assertIn("u32 *", offset)
++
++    def test_indexed_access_keeps_byte_index_and_instruction_width(self):
++        word = self.translate("lwzx r3,r3,r4", "unsigned int test(unsigned char *bytes, unsigned int offset);")
++        self.assertIn("u32 *", word)
++        self.assertNotIn("return bytes[offset]", word)
++        store = self.translate("stwx r5,r3,r4", "void test(unsigned char *bytes, unsigned int offset, unsigned int value);")
++        self.assertIn("u32 *", store)
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for independent big-endian codegen")
++    def test_halfword_of_word_global_uses_big_endian_memory_not_numeric_truncation(self):
++        generated = self.translate("lis r3,word@ha\nlhz r3,word@l(r3)",
++                                   "extern unsigned int word; unsigned short test(void);")
++        self.assertIn("*(u16 *) &word", generated)
++        self.assertNotIn("(u16) word", generated)
++        targets = subprocess.run([shutil.which("clang"), "--print-targets"],
++                                 capture_output=True, text=True, timeout=30)
++        self.assertEqual(targets.returncode, 0, targets.stderr)
++        if "ppc32" in targets.stdout:
++            triple, instruction = "powerpc-unknown-linux-gnu", "lhz"
++        elif "armeb" in targets.stdout:
++            triple, instruction = "armeb-unknown-linux-gnueabi", "ldrh"
++        else:
++            self.skipTest("Clang has no supported big-endian backend")
++        with tempfile.TemporaryDirectory() as name:
++            source = Path(name) / "test.c"
++            source.write_text("typedef unsigned int u32; typedef unsigned short u16;\n"
++                              "extern unsigned int word;\n" + generated)
++            compiled = subprocess.run([shutil.which("clang"), "-target", triple,
++                                       "-ffreestanding", "-fno-pic", "-std=c89", "-O2", "-S",
++                                       str(source), "-o", "-"], capture_output=True, text=True, timeout=30)
++            self.assertEqual(compiled.returncode, 0, compiled.stderr)
++            self.assertRegex(compiled.stdout, r"(?m)^\s+" + instruction + r"\s")
++
++    def test_known_aggregate_member_does_not_cast_the_whole_struct(self):
++        generated = self.translate("lwz r3,0(r3)",
++                                   "struct Record { unsigned int value; unsigned int other; }; "
++                                   "unsigned int test(struct Record *record);")
++        self.assertIn("return record->value;", generated)
++        self.assertNotIn("(u32 *) record", generated)
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for independent C execution")
++    def test_generated_word_load_store_and_partial_store_execute_at_the_right_width(self):
++        cases = [
++            ("lwz r3,0(r3)", "unsigned int test(unsigned char *bytes);",
++             "return test((unsigned char *)words) != 0x12345678U;"),
++            ("stw r4,0(r3)", "void test(unsigned char *bytes, unsigned int value);",
++             "test((unsigned char *)words, 0x89abcdefU); return words[0] != 0x89abcdefU || words[1] != 0x87654321U;"),
++            ("stb r4,0(r3)", "void test(unsigned int *words, unsigned char value);",
++             "unsigned char before[sizeof(words)]; unsigned int i; "
++             "for(i=0;i<sizeof(words);i++) before[i]=((unsigned char *)words)[i]; "
++             "test(words, 0xAB); if(((unsigned char *)words)[0]!=0xAB) return 1; "
++             "for(i=1;i<sizeof(words);i++) if(((unsigned char *)words)[i]!=before[i]) return 2; return 0;"),
++        ]
++        for instructions, context, body in cases:
++            with self.subTest(instructions=instructions), tempfile.TemporaryDirectory() as name:
++                generated = self.translate(instructions, context)
++                source = ("typedef unsigned int u32; typedef unsigned char u8;\n" + generated
++                          + "\nint main(void) { unsigned int words[2]={0x12345678U,0x87654321U}; " + body + " }\n")
++                path, executable = Path(name) / "test.c", Path(name) / "test"
++                path.write_text(source)
++                compiled = subprocess.run([shutil.which("clang"), "-std=c89", "-O2", "-Wall", "-Werror",
++                                           str(path), "-o", str(executable)], capture_output=True, text=True, timeout=30)
++                self.assertEqual(compiled.returncode, 0, compiled.stderr)
++                self.assertEqual(subprocess.run([str(executable)], timeout=10).returncode, 0)

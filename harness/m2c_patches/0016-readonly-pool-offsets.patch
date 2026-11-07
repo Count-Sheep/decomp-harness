@@ -1,0 +1,99 @@
+diff --git a/m2c/asm_file.py b/m2c/asm_file.py
+index 0d8b994..8310b3d 100644
+--- a/m2c/asm_file.py
++++ b/m2c/asm_file.py
+@@ -144,6 +144,8 @@ class AsmDataEntry:
+     def data_at_offset(
+         self, offset: int, size: int
+     ) -> Optional[Union[bytes, AsmSymbolicData]]:
++        if offset < 0 or size <= 0:
++            return None
+         for data in self.data:
+             subsize = len(data) if isinstance(data, bytes) else data.size
+             if offset >= subsize:
+@@ -155,7 +157,7 @@ class AsmDataEntry:
+                     return None
+                 return data
+             else:
+-                if data.size != size:
++                if offset != 0 or data.size != size:
+                     return None
+                 return data
+         return None
+diff --git a/m2c/evaluate.py b/m2c/evaluate.py
+index 1d5ba9a..f9bc3e8 100644
+--- a/m2c/evaluate.py
++++ b/m2c/evaluate.py
+@@ -533,9 +533,10 @@ def handle_load(args: InstrArgs, type: Type) -> Expression:
+         if (
+             not is_arm
+             and not is_sh
+-            and (not type.is_likely_float() or expr.offset != 0)
++            and not type.is_likely_float()
+         ):
+-            # Outside of ARM/SH, only allow float constants and offset 0.
++            # Outside of ARM/SH, only allow float constants. The data lookup
++            # below proves that the full load lies within this readonly entry.
+             return None
+ 
+         target = early_unwrap(expr.struct_var)
+diff --git a/tests/unit/test_readonly_constants.py b/tests/unit/test_readonly_constants.py
+new file mode 100644
+index 0000000..9f0db5d
+--- /dev/null
++++ b/tests/unit/test_readonly_constants.py
+@@ -0,0 +1,54 @@
++from pathlib import Path
++import tempfile
++import unittest
++
++from m2c.asm_file import AsmDataEntry, AsmSymbolicData
++from m2c.asm_instruction import AsmGlobalSymbol
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestReadonlyConstants(unittest.TestCase):
++    def translate(self, instructions, data, context="float test(void);", section=".sdata2"):
++        with tempfile.TemporaryDirectory() as name:
++            root = Path(name)
++            (root / "target.s").write_text(
++                ".text\n.fn test, global\n" + instructions + "\nblr\n.endfn test\n"
++                + '.section ' + section + ', "a"\n.obj "@pool", local\n' + data + '\n.endobj "@pool"\n')
++            (root / "context.c").write_text(context)
++            return decompile_and_capture_output(parse_flags([
++                "-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache", "--no-unk-inference",
++                "--explicit-field-access", "--context", str(root / "context.c"), str(root / "target.s")]))
++
++    def test_float_pool_offset_is_loaded_from_the_exact_bytes(self):
++        code = self.translate('lis r3,"@pool"@ha\naddi r3,r3,"@pool"@l\nlfs f1,4(r3)',
++                              '.4byte 0x3F800000\n.4byte 0x40200000')
++        self.assertIn("return 2.5f;", code)
++        self.assertNotIn("@pool", code)
++
++    def test_double_pool_offset_preserves_negative_zero(self):
++        code = self.translate('lis r3,"@pool"@ha\naddi r3,r3,"@pool"@l\nlfd f1,8(r3)',
++                              '.4byte 0x3FF00000, 0\n.4byte 0x80000000, 0', "double test(void);")
++        self.assertIn("return -0.0;", code)
++        self.assertNotIn("@pool", code)
++
++    def test_writable_data_is_not_folded(self):
++        code = self.translate('lis r3,"@pool"@ha\naddi r3,r3,"@pool"@l\nlfs f1,4(r3)',
++                              '.4byte 0x3F800000\n.4byte 0x40200000', section=".data")
++        self.assertNotIn("return 2.5f;", code)
++
++    def test_negative_and_out_of_bounds_reads_are_not_satisfied(self):
++        entry = AsmDataEntry(("test", 0), data=[bytes(range(16))])
++        self.assertIsNone(entry.data_at_offset(-8, 4))
++        self.assertIsNone(entry.data_at_offset(14, 4))
++        self.assertEqual(entry.data_at_offset(4, 4), bytes(range(4, 8)))
++
++    def test_symbolic_data_cannot_be_read_from_an_interior_offset(self):
++        symbol = AsmSymbolicData(AsmGlobalSymbol("external"), 4)
++        entry = AsmDataEntry(("test", 0), data=[symbol])
++        self.assertIsNone(entry.data_at_offset(1, 4))
++        self.assertEqual(entry.data_at_offset(0, 4), symbol)
++
++
++if __name__ == "__main__":
++    unittest.main()

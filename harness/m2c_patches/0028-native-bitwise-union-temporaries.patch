@@ -1,0 +1,177 @@
+diff --git a/m2c/if_statements.py b/m2c/if_statements.py
+index ca3b831..39d390a 100644
+--- a/m2c/if_statements.py
++++ b/m2c/if_statements.py
+@@ -1430,6 +1430,7 @@ def build_body(context: Context, options: Options) -> Body:
+ 
+ def get_function_text(function_info: FunctionInfo, options: Options) -> str:
+     fmt = options.formatter()
++    fmt.bitwise_function_scope = True
+     context = Context(flow_graph=function_info.flow_graph, options=options, fmt=fmt)
+     body: Body = build_body(context, options)
+ 
+@@ -1475,6 +1476,10 @@ def get_function_text(function_info: FunctionInfo, options: Options) -> str:
+         # Format the body first, because this can result in additional type inferencce
+         formatted_body = body.format(fmt)
+ 
++        for declaration in fmt.bitwise_temporaries:
++            function_lines.append(SimpleStatement(declaration).format(fmt))
++            any_decl = True
++
+         global_info = function_info.stack_info.global_info
+         referenced = {sym.c_symbol_name for sym in global_info.global_symbol_map.values()
+                       if sym.is_referenced}
+diff --git a/m2c/options.py b/m2c/options.py
+index 557df10..9123e73 100644
+--- a/m2c/options.py
++++ b/m2c/options.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ import contextlib
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ import enum
+ from pathlib import Path
+ from typing import Dict, Iterator, List, Optional, Union
+@@ -243,6 +243,8 @@ class Formatter:
+     descending_regs: bool = False
+     backwards_bss: bool = False
+     explicit_field_access: bool = False
++    bitwise_temporaries: List[str] = field(default_factory=list)
++    bitwise_function_scope: bool = False
+ 
+     def indent(self, line: str, indent: int = 0) -> str:
+         return self.indent_step * max(indent + self.extra_indent, 0) + line
+diff --git a/m2c/translate.py b/m2c/translate.py
+index e3a5b4e..1b78c7b 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1530,6 +1530,23 @@ class Cast(Expression):
+         if self.reinterpret and self.expr.type.is_float() != self.type.is_float():
+             # This shouldn't happen, but mark it in the output if it does.
+             if fmt.valid_syntax:
++                source, target = self.expr.type, self.type
++                source_bits, target_bits = source.get_size_bits() or 32, target.get_size_bits() or 32
++                narrow_integer = source.is_float() and target.is_int() and target_bits < source_bits
++                if (fmt.bitwise_function_scope and (source_bits == target_bits or narrow_integer)
++                        and source_bits in (32, 64)
++                        and source.data().kind in (TypeData.K_INT, TypeData.K_FLOAT)
++                        and target.data().kind in (TypeData.K_INT, TypeData.K_FLOAT)):
++                    # A distinct union per occurrence avoids aliasing casts and
++                    # unsequenced writes when several bitcasts share an expression.
++                    value = self.expr.format(fmt)
++                    name = f"__m2c_bitcast_{len(fmt.bitwise_temporaries)}"
++                    result_type = f"u{source_bits}" if narrow_integer else target.format(fmt)
++                    fmt.bitwise_temporaries.append(
++                        f"union {{ {source.format(fmt)} from; {result_type} to; }} {name};"
++                    )
++                    result = f"({name}.from = {value}, {name}.to)"
++                    return f"(({target.format(fmt)}) {result})" if narrow_integer else result
+                 return f"M2C_BITWISE({self.type.format(fmt)}, {self.expr.format(fmt)})"
+             return f"(bitwise {self.type.format(fmt)}) {self.expr.format(fmt)}"
+         if fmt.valid_syntax and self.reinterpret and (
+diff --git a/tests/unit/test_bitwise_temporaries.py b/tests/unit/test_bitwise_temporaries.py
+new file mode 100644
+index 0000000..2932260
+--- /dev/null
++++ b/tests/unit/test_bitwise_temporaries.py
+@@ -0,0 +1,99 @@
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from m2c.options import Formatter
++from m2c.translate import Cast, GlobalSymbol, FuncCall
++from m2c.types import Type
++from tests.unit import test_native_drafts
++
++
++class TestBitwiseTemporaries(unittest.TestCase):
++    def test_file_scope_does_not_reference_undeclared_local_temporaries(self):
++        fmt = Formatter(valid_syntax=True)
++        expr = Cast(GlobalSymbol('value', Type.f32()), Type.u32(), reinterpret=True)
++        self.assertIn('M2C_BITWISE', expr.format(fmt))
++        self.assertEqual(fmt.bitwise_temporaries, [])
++
++    def test_native_function_emits_union_before_its_use(self):
++        code = test_native_drafts.TestNativeDrafts().translate(
++            'stwu r1,-16(r1)\nstfs f1,8(r1)\nlwz r3,8(r1)\naddi r1,r1,16\nblr',
++            'unsigned int test(float value);')
++        self.assertNotIn('M2C_BITWISE', code)
++        self.assertIn('union { f32 from; u32 to; } __m2c_bitcast_0;', code)
++        self.assertLess(code.index('union {'), code.index('__m2c_bitcast_0.from ='))
++
++    def test_known_equal_widths_use_distinct_union_temporaries(self):
++        fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++        expr = Cast(GlobalSymbol('value', Type.f32()), Type.u32(), reinterpret=True)
++        self.assertEqual(expr.format(fmt), '(__m2c_bitcast_0.from = value, __m2c_bitcast_0.to)')
++        self.assertEqual(expr.format(fmt), '(__m2c_bitcast_1.from = value, __m2c_bitcast_1.to)')
++        self.assertEqual(fmt.bitwise_temporaries[0], 'union { f32 from; u32 to; } __m2c_bitcast_0;')
++        self.assertEqual(Formatter().bitwise_temporaries, [])
++        self.assertIn('(bitwise u32)', expr.format(Formatter()))
++
++    def test_unknown_or_mismatched_widths_remain_explicit(self):
++        for source, target in ((Type.f32(), Type.u64()), (Type.any(), Type.f32()),
++                               (Type.u16(), Type.f32()), (Type.ptr(), Type.f32())):
++            fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++            expr = Cast(GlobalSymbol('value', source), target, reinterpret=True)
++            self.assertIn('M2C_BITWISE', expr.format(fmt))
++            self.assertEqual(fmt.bitwise_temporaries, [])
++
++    def test_narrow_integer_reads_low_bits_after_full_width_reinterpretation(self):
++        fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++        result = Cast(GlobalSymbol('value', Type.f32()), Type.s8(), reinterpret=True).format(fmt)
++        self.assertIn('u32 to;', fmt.bitwise_temporaries[0])
++        self.assertTrue(result.startswith('((s8) '))
++        fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++        result = Cast(GlobalSymbol('value', Type.f32()), Type.uintish(), reinterpret=True).format(fmt)
++        self.assertNotIn('M2C_BITWISE', result)
++        self.assertIn('u32 to;', fmt.bitwise_temporaries[0])
++
++    @unittest.skipUnless(shutil.which('clang'), 'Clang required for executable checks')
++    def test_float_bits_survive_round_trip(self):
++        fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++        expr = Cast(Cast(GlobalSymbol('value', Type.u32()), Type.f32(), reinterpret=True),
++                    Type.u32(), reinterpret=True).format(fmt)
++        once_fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++        call = FuncCall(GlobalSymbol('next_value', Type.any()), [], Type.f32())
++        once = Cast(call, Type.u32(), reinterpret=True).format(once_fmt)
++        narrow_fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++        narrow = Cast(Cast(GlobalSymbol('value', Type.u32()), Type.f32(), reinterpret=True),
++                      Type.u8(), reinterpret=True).format(narrow_fmt)
++        text = ('typedef float f32; typedef unsigned int u32; typedef unsigned char u8;\n'
++                'u32 round_trip(u32 value) { ' + ' '.join(fmt.bitwise_temporaries)
++                + f' return {expr}; }}\n'
++                'static int calls; f32 next_value(void) { ++calls; return 1.0f; }\n'
++                'u32 once(void) { ' + ' '.join(once_fmt.bitwise_temporaries) + f' return {once}; }}\n'
++                'u8 narrow(u32 value) { ' + ' '.join(narrow_fmt.bitwise_temporaries) + f' return {narrow}; }}\n'
++                'int main(void) { return round_trip(0x3f800000U) != 0x3f800000U || '
++                'round_trip(0x80000000U) != 0x80000000U || round_trip(0) != 0 || '
++                'once() != 0x3f800000U || calls != 1 || narrow(0x3f8000abU) != 0xab; }\n')
++        with tempfile.TemporaryDirectory() as directory:
++            path, binary = Path(directory) / 'cast.c', Path(directory) / 'cast'
++            path.write_text(text)
++            result = subprocess.run([shutil.which('clang'), '-std=c89', '-Werror', '-O2',
++                                     str(path), '-o', str(binary)], capture_output=True, text=True, timeout=30)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            self.assertEqual(subprocess.run([str(binary)], timeout=30).returncode, 0)
++
++    @unittest.skipUnless(shutil.which('clang'), 'Clang required for C89 checks')
++    def test_generated_casts_compile_for_powerpc(self):
++        text = ('typedef float f32; typedef double f64; typedef unsigned int u32; '
++                'typedef unsigned long long u64;\n')
++        for index, (source, target) in enumerate(((Type.f32(), Type.u32()), (Type.u32(), Type.f32()),
++                                                (Type.f64(), Type.u64()), (Type.u64(), Type.f64()))):
++            fmt = Formatter(valid_syntax=True, bitwise_function_scope=True)
++            expr = Cast(GlobalSymbol('value', source), target, reinterpret=True).format(fmt)
++            text += (f'{target.format(fmt)} convert{index}({source.format(fmt)} value) {{ '
++                     + ' '.join(fmt.bitwise_temporaries) + f' return {expr}; }}\n')
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'cast.c'
++            path.write_text(text)
++            result = subprocess.run([shutil.which('clang'), '-target', 'powerpc-unknown-none',
++                                     '-std=c89', '-fsyntax-only', '-Werror', str(path)],
++                                    capture_output=True, text=True, timeout=30)
++            self.assertEqual(result.returncode, 0, text + result.stderr)

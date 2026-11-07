@@ -1,0 +1,380 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+index e5552ae..166eebe 100644
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -66,6 +66,7 @@ from .translate import (
+     as_u32,
+     as_uintish,
+     as_type,
++    early_unwrap,
+     format_hex,
+ )
+ from .evaluate import (
+@@ -101,6 +102,33 @@ from .flow_graph import ArchFlowGraph, FlowGraph, InstrRef, RefSet
+ from .types import FunctionSignature, Type
+ 
+ 
++def cr_logical(mnemonic: str, left: Expression, right: Expression) -> Expression:
++    def negate(value: Expression) -> Expression:
++        return UnaryOp("!", value, type=Type.boolean())
++
++    if mnemonic in ("crandc", "crorc"):
++        right = negate(right)
++    op = {
++        "crand": "&&", "crandc": "&&", "crnand": "&&",
++        "cror": "||", "crorc": "||", "crnor": "||",
++        "crxor": "!=", "creqv": "==",
++    }[mnemonic]
++    result: Expression = BinaryOp(left, op, right, type=Type.boolean())
++    if mnemonic == "cror":
++        # Comparisons may be separated by stores or scheduled arithmetic.
++        a, b = early_unwrap(left), early_unwrap(right)
++        if (isinstance(a, BinaryOp) and isinstance(b, BinaryOp)
++                and a.left is b.left and a.right is b.right):
++            operators = {a.op, b.op}
++            if operators == {"<", "=="}:
++                result = replace(a, op="<=")
++            elif operators == {">", "=="}:
++                result = replace(a, op=">=")
++    if mnemonic in ("crnand", "crnor"):
++        result = negate(result)
++    return result
++
++
+ class FcmpoCrorPattern(SimpleAsmPattern):
+     """
+     For floating point, `x <= y` and `x >= y` use `cror` to OR together the `cr0_eq`
+@@ -960,8 +988,10 @@ class PpcArch(Arch):
+             "cror", "crorc", "crand", "crandc", "crxor", "crnand", "crnor",
+             "creqv", "crnot", "crmove", "crclr", "crset",
+         }:
+-            # DTK/GAS can spell CR0 bits symbolically instead of as bit indices.
++            # DTK/GAS use both bare CR0 names and field-qualified bit names.
+             bits = {"lt": 0, "gt": 1, "eq": 2, "so": 3, "un": 3}
++            bits.update({f"cr{field}{bit}": 4 * field + index
++                         for field in range(8) for bit, index in list(bits.items())})
+             args = [
+                 AsmLiteral(bits[arg.symbol_name])
+                 if isinstance(arg, AsmGlobalSymbol) and arg.symbol_name in bits
+@@ -1517,6 +1547,36 @@ class PpcArch(Arch):
+                 s.set_reg_real(a.reg_ref(0), dst_out, function_return=True)
+                 s.set_reg_real(a.reg_ref(1), src_out, function_return=True)
+ 
++        elif mnemonic in {
++            "cror", "crorc", "crand", "crandc", "crxor", "crnand", "crnor",
++            "creqv", "crnot", "crmove", "crclr", "crset",
++        }:
++            arity = 1 if mnemonic in {"crclr", "crset"} else 2 if mnemonic in {"crnot", "crmove"} else 3
++            if len(args) != arity or any(not isinstance(arg, AsmLiteral) or not 0 <= arg.value < 32 for arg in args):
++                raise DecompFailure(f"Invalid condition-register bit operands: {instr_str}")
++            bits = [Register(f"cr{arg.value // 4}_{('lt', 'gt', 'eq', 'so')[arg.value % 4]}") for arg in args]
++            outputs = [bits[0]]
++            constant = None
++            if mnemonic in {"crclr", "crset"}:
++                constant = int(mnemonic == "crset")
++            elif len(bits) == 3 and bits[1] == bits[2]:
++                if mnemonic in {"crxor", "crandc"}:
++                    constant = 0
++                elif mnemonic in {"creqv", "crorc"}:
++                    constant = 1
++            inputs = [] if constant is not None else list(dict.fromkeys(bits[1:]))
++
++            def eval_fn(s: NodeState, a: InstrArgs) -> None:
++                if constant is not None:
++                    value: Expression = Literal(constant, type=Type.boolean())
++                elif mnemonic == "crmove":
++                    value = a.regs[bits[1]]
++                elif mnemonic == "crnot":
++                    value = UnaryOp("!", a.regs[bits[1]], type=Type.boolean())
++                else:
++                    value = cr_logical(mnemonic, a.regs[bits[1]], a.regs[bits[2]])
++                s.set_reg(bits[0], value)
++
+         elif mnemonic in cls.instrs_ppc_compare:
+             assert len(args) == 3 and isinstance(args[1], Register)
+             inputs = [r for r in args[1:] if isinstance(r, Register)]
+@@ -1529,7 +1589,16 @@ class PpcArch(Arch):
+                 s.set_reg(Register(f"{prefix}_eq"), cls.instrs_ppc_compare[mnemonic](a, "=="))
+                 s.set_reg(Register(f"{prefix}_gt"), cls.instrs_ppc_compare[mnemonic](a, ">"))
+                 s.set_reg(Register(f"{prefix}_lt"), cls.instrs_ppc_compare[mnemonic](a, "<"))
+-                s.set_reg(Register(f"{prefix}_so"), Literal(0))
++                if mnemonic.startswith("fcmp"):
++                    # The fourth floating-point CR bit is unordered, not XER.SO.
++                    x, y = a.reg(1), a.reg(2)
++                    unordered = BinaryOp(
++                        BinaryOp(x, "!=", x, type=Type.boolean()), "||",
++                        BinaryOp(y, "!=", y, type=Type.boolean()), type=Type.boolean(),
++                    )
++                    s.set_reg(Register(f"{prefix}_so"), unordered)
++                else:
++                    s.set_reg(Register(f"{prefix}_so"), Literal(0))
+ 
+         elif mnemonic in cls.instrs_ignore:
+             pass
+diff --git a/tests/unit/test_cr_logical.py b/tests/unit/test_cr_logical.py
+new file mode 100644
+index 0000000..7f2ae52
+--- /dev/null
++++ b/tests/unit/test_cr_logical.py
+@@ -0,0 +1,115 @@
++import math
++import unittest
++from types import SimpleNamespace
++
++from m2c.arch_ppc import PpcArch, cr_logical
++from m2c.asm_instruction import AsmGlobalSymbol, AsmInstruction, AsmLiteral, AsmState, Register
++from m2c.error import DecompFailure
++from m2c.instruction import InstructionMeta
++from m2c.translate import BinaryOp, Literal, UnaryOp
++from m2c.types import Type
++
++
++def evaluate(expr):
++    if isinstance(expr, Literal):
++        return expr.value
++    if isinstance(expr, UnaryOp) and expr.op == '!':
++        return not evaluate(expr.expr)
++    if isinstance(expr, BinaryOp):
++        a, b = evaluate(expr.left), evaluate(expr.right)
++        return {'&&': lambda: bool(a) and bool(b), '||': lambda: bool(a) or bool(b),
++                '==': lambda: a == b, '!=': lambda: a != b, '<': lambda: a < b,
++                '>': lambda: a > b, '<=': lambda: a <= b, '>=': lambda: a >= b}[expr.op]()
++    raise AssertionError(expr)
++
++
++class TestCrLogical(unittest.TestCase):
++    def parse(self, mnemonic, *bits):
++        return PpcArch.parse(mnemonic, [AsmLiteral(bit) for bit in bits], InstructionMeta.missing())
++
++    def test_truth_tables(self):
++        operations = {'cror': lambda a, b: a or b, 'crorc': lambda a, b: a or not b,
++                      'crand': lambda a, b: a and b, 'crandc': lambda a, b: a and not b,
++                      'crxor': lambda a, b: a != b, 'creqv': lambda a, b: a == b,
++                      'crnand': lambda a, b: not (a and b), 'crnor': lambda a, b: not (a or b)}
++        for mnemonic, operation in operations.items():
++            for a in (0, 1):
++                for b in (0, 1):
++                    with self.subTest(mnemonic=mnemonic, a=a, b=b):
++                        self.assertEqual(bool(evaluate(cr_logical(mnemonic, Literal(a), Literal(b)))), operation(a, b))
++
++    def test_reads_source_bits_and_only_writes_destination(self):
++        instruction = self.parse('cror', 30, 9, 22)
++        self.assertEqual(instruction.inputs, [Register('cr2_gt'), Register('cr5_eq')])
++        self.assertEqual(instruction.outputs, [Register('cr7_eq')])
++
++    def test_field_qualified_symbolic_operands_include_varargs_marker(self):
++        for field in range(8):
++            for index, bit in enumerate(('lt', 'gt', 'eq', 'so')):
++                raw = AsmInstruction('crclr', [AsmGlobalSymbol(f'cr{field}{bit}')])
++                normalized = PpcArch.normalize_instruction(raw, AsmState())
++                self.assertEqual(normalized.args, [AsmLiteral(4 * field + index)])
++                parsed = PpcArch.parse(normalized.mnemonic, normalized.args, InstructionMeta.missing())
++                self.assertEqual(parsed.inputs, [])
++                self.assertEqual(parsed.outputs, [Register(f'cr{field}_{bit}')])
++
++    def test_constant_idioms_do_not_read_unset_bits(self):
++        for mnemonic, value in [('crxor', 0), ('crandc', 0), ('creqv', 1), ('crorc', 1)]:
++            instruction = self.parse(mnemonic, 30, 9, 9)
++            self.assertEqual(instruction.inputs, [])
++            results = {}
++            instruction.eval_fn(SimpleNamespace(set_reg=lambda reg, expr: results.update({reg: expr})), None)
++            self.assertEqual(evaluate(results[Register('cr7_eq')]), value)
++
++    def test_alias_read_write_sets(self):
++        self.assertEqual(self.parse('crmove', 30, 9).inputs, [Register('cr2_gt')])
++        self.assertEqual(self.parse('crnot', 30, 9).inputs, [Register('cr2_gt')])
++        self.assertEqual(self.parse('crset', 30).inputs, [])
++        self.assertEqual(self.parse('crclr', 30).outputs, [Register('cr7_eq')])
++
++    def test_invalid_indices_and_arity_are_rejected(self):
++        for operands in [(-1, 0, 2), (32, 1, 2), (2, 1), (2, 1, 32)]:
++            with self.assertRaises(DecompFailure):
++                self.parse('cror', *operands)
++
++    def test_ordered_union_and_negation_preserve_nan(self):
++        for a in (-math.inf, -1.0, 0.0, 1.0, math.inf, math.nan):
++            for b in (-math.inf, 0.0, math.inf, math.nan):
++                left, right = Literal(a, type=Type.f32()), Literal(b, type=Type.f32())
++                for op, combined in [('<', '<='), ('>', '>=')]:
++                    relation = BinaryOp(left, op, right, type=Type.boolean())
++                    equality = BinaryOp(left, '==', right, type=Type.boolean())
++                    for x, y in [(relation, equality), (equality, relation)]:
++                        result = cr_logical('cror', x, y)
++                        self.assertEqual(result.op, combined)
++                        self.assertEqual(evaluate(result), evaluate(relation) or evaluate(equality))
++                        self.assertEqual(evaluate(result.negated()), not evaluate(result))
++
++    def test_different_operands_are_not_merged(self):
++        x, y, z = Literal(1), Literal(2), Literal(3)
++        a = BinaryOp(x, '>', y, type=Type.boolean())
++        b = BinaryOp(x, '==', z, type=Type.boolean())
++        self.assertEqual(cr_logical('cror', a, b).op, '||')
++
++    def test_floating_unordered_bit_is_not_constant_zero(self):
++        for mnemonic in ('fcmpo', 'fcmpu'):
++            for x, y in [(1.0, 2.0), (math.inf, math.inf), (math.nan, 2.0), (1.0, math.nan)]:
++                args = [Register('cr3'), Register('f1'), Register('f2')]
++                instruction = PpcArch.parse(mnemonic, args, InstructionMeta.missing())
++                values = {1: Literal(x, type=Type.f32()), 2: Literal(y, type=Type.f32())}
++                result = {}
++                instruction.eval_fn(SimpleNamespace(set_reg=lambda reg, expr: result.update({reg: expr})),
++                                    SimpleNamespace(reg=lambda index: values[index]))
++                self.assertEqual(bool(evaluate(result[Register('cr3_so')])), math.isnan(x) or math.isnan(y))
++
++    def test_overwriting_destination_does_not_change_source_values(self):
++        instruction = self.parse('cror', 2, 1, 2)
++        regs = {Register('cr0_gt'): Literal(1), Register('cr0_eq'): Literal(0)}
++        instruction.eval_fn(SimpleNamespace(set_reg=lambda reg, expr: regs.update({reg: expr})),
++                            SimpleNamespace(regs=regs))
++        self.assertTrue(evaluate(regs[Register('cr0_eq')]))
++        self.assertEqual(evaluate(regs[Register('cr0_gt')]), 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/end_to_end/ppc-scheduled-cror/manual.s b/tests/end_to_end/ppc-scheduled-cror/manual.s
+new file mode 100644
+index 0000000..729bc76
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-cror/manual.s
+@@ -0,0 +1,11 @@
++.global test
++test:
++fcmpo cr0, f1, f2
++stfs f1, 0(r3)
++cror eq, gt, eq
++bne .L_false
++li r3, 1
++blr
++.L_false:
++li r3, 0
++blr
+diff --git a/tests/end_to_end/ppc-scheduled-cror/manual-flags.txt b/tests/end_to_end/ppc-scheduled-cror/manual-flags.txt
+new file mode 100644
+index 0000000..4b6bad7
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-cror/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c
+diff --git a/tests/end_to_end/ppc-scheduled-cror/manual-out.c b/tests/end_to_end/ppc-scheduled-cror/manual-out.c
+new file mode 100644
+index 0000000..f296c91
+--- /dev/null
++++ b/tests/end_to_end/ppc-scheduled-cror/manual-out.c
+@@ -0,0 +1,7 @@
++s32 test(f32 *arg0, f32 farg0, f32 farg1) {
++    *arg0 = farg0;
++    if (farg0 >= farg1) {
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-cror-nondefault/manual.s b/tests/end_to_end/ppc-cror-nondefault/manual.s
+new file mode 100644
+index 0000000..063037c
+--- /dev/null
++++ b/tests/end_to_end/ppc-cror-nondefault/manual.s
+@@ -0,0 +1,11 @@
++.global test
++test:
++fcmpu cr3, f1, f2
++stfs f1, 0(r3)
++cror 14, 14, 12
++bne cr3, .L_false
++li r3, 1
++blr
++.L_false:
++li r3, 0
++blr
+diff --git a/tests/end_to_end/ppc-cror-nondefault/manual-flags.txt b/tests/end_to_end/ppc-cror-nondefault/manual-flags.txt
+new file mode 100644
+index 0000000..4b6bad7
+--- /dev/null
++++ b/tests/end_to_end/ppc-cror-nondefault/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c
+diff --git a/tests/end_to_end/ppc-cror-nondefault/manual-out.c b/tests/end_to_end/ppc-cror-nondefault/manual-out.c
+new file mode 100644
+index 0000000..2e8d89b
+--- /dev/null
++++ b/tests/end_to_end/ppc-cror-nondefault/manual-out.c
+@@ -0,0 +1,7 @@
++s32 test(f32 *arg0, f32 farg0, f32 farg1) {
++    *arg0 = farg0;
++    if (farg0 <= farg1) {
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-cr-unordered/manual.s b/tests/end_to_end/ppc-cr-unordered/manual.s
+new file mode 100644
+index 0000000..afd935a
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-unordered/manual.s
+@@ -0,0 +1,9 @@
++.global test
++test:
++fcmpu cr3, f1, f2
++bun cr3, .L_unordered
++li r3, 0
++blr
++.L_unordered:
++li r3, 1
++blr
+diff --git a/tests/end_to_end/ppc-cr-unordered/manual-flags.txt b/tests/end_to_end/ppc-cr-unordered/manual-flags.txt
+new file mode 100644
+index 0000000..4b6bad7
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-unordered/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c
+diff --git a/tests/end_to_end/ppc-cr-unordered/manual-out.c b/tests/end_to_end/ppc-cr-unordered/manual-out.c
+new file mode 100644
+index 0000000..30b2b0e
+--- /dev/null
++++ b/tests/end_to_end/ppc-cr-unordered/manual-out.c
+@@ -0,0 +1,6 @@
++s32 test(f32 farg0, f32 farg1) {
++    if (((farg0 != farg0) || (farg1 != farg1)) == 0) {
++        return 0;
++    }
++    return 1;
++}
+diff --git a/tests/end_to_end/ppc-cror-overwritten-fpr/manual.s b/tests/end_to_end/ppc-cror-overwritten-fpr/manual.s
+new file mode 100644
+index 0000000..be95213
+--- /dev/null
++++ b/tests/end_to_end/ppc-cror-overwritten-fpr/manual.s
+@@ -0,0 +1,12 @@
++.global test
++test:
++fcmpo cr0, f1, f2
++fmr f1, f3
++stfs f1, 0(r3)
++cror eq, gt, eq
++bne .L_false
++li r3, 1
++blr
++.L_false:
++li r3, 0
++blr
+diff --git a/tests/end_to_end/ppc-cror-overwritten-fpr/manual-flags.txt b/tests/end_to_end/ppc-cror-overwritten-fpr/manual-flags.txt
+new file mode 100644
+index 0000000..4b6bad7
+--- /dev/null
++++ b/tests/end_to_end/ppc-cror-overwritten-fpr/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c
+diff --git a/tests/end_to_end/ppc-cror-overwritten-fpr/manual-out.c b/tests/end_to_end/ppc-cror-overwritten-fpr/manual-out.c
+new file mode 100644
+index 0000000..a07228e
+--- /dev/null
++++ b/tests/end_to_end/ppc-cror-overwritten-fpr/manual-out.c
+@@ -0,0 +1,7 @@
++s32 test(f32 *arg0, f32 farg0, f32 farg1, f32 farg2) {
++    *arg0 = farg2;
++    if (farg0 >= farg1) {
++        return 1;
++    }
++    return 0;
++}

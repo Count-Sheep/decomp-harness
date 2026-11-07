@@ -1,0 +1,67 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 6247101..2bfd447 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -913,8 +913,20 @@ def get_stack_info(
+     # Precompute overlapping PPC accesses so a narrow first store cannot choose
+     # an undersized local before a later wider read is translated.
+     accesses: Set[Tuple[int, int]] = set()
++    local_addresses: Set[int] = set()
+     for instr in function.body:
+-        if not isinstance(instr, Instruction) or instr.in_pattern or not instr.memory_size:
++        if not isinstance(instr, Instruction) or instr.in_pattern:
++            continue
++        if (global_info.arch.arch == Target.ArchEnum.PPC
++                and instr.mnemonic == "addi" and len(instr.args) == 3
++                and isinstance(instr.args[1], Register) and info.is_stack_reg(instr.args[1])
++                and isinstance(instr.args[2], AsmLiteral)
++                and instr.args[0] != instr.args[1]):
++            location = instr.args[2].value
++            end = info.callee_save_reg_region[0] or info.allocated_stack_size
++            if 8 <= location < end:
++                local_addresses.add(location)
++        if not instr.memory_size:
+             continue
+         for arg in instr.args:
+             if not (isinstance(arg, AsmAddressMode) and info.is_stack_reg(arg.base)
+@@ -925,7 +937,8 @@ def get_stack_info(
+                     and not any(info.in_callee_save_reg_region(offset) for offset in range(start, end))
+                     and not info.in_subroutine_arg_region(start)):
+                 accesses.add((start, end))
+-    if global_info.ppc_stack_storage and global_info.arch.arch == Target.ArchEnum.PPC and accesses:
++    if (global_info.ppc_stack_storage and global_info.arch.arch == Target.ArchEnum.PPC
++            and (accesses or local_addresses)):
+         # Preserve the machine's local storage, excluding the ABI header and saved registers.
+         end = info.callee_save_reg_region[0] or info.allocated_stack_size
+         start = 8
+diff --git a/tests/unit/test_ppc_stack_storage.py b/tests/unit/test_ppc_stack_storage.py
+index c0fc034..78a1fa0 100644
+--- a/tests/unit/test_ppc_stack_storage.py
++++ b/tests/unit/test_ppc_stack_storage.py
+@@ -46,9 +46,25 @@ class TestPpcStackStorage(unittest.TestCase):
+         self.assertNotIn("spC", code)
+         self.assertNotIn("_storage", self.translate(enabled=False))
+ 
++    def test_address_only_buffer_does_not_need_direct_memory_accesses(self):
++        body = BODY.replace("lwz r3,8(r1)\nlwz r4,12(r1)\nadd r3,r3,r4", "li r3,0")
++        code = self.translate(body=body)
++        self.assertIn("union _m2c_stack_test_storage sp8;", code)
++        self.assertIn("u8[0x14]", code)
++        self.assertNotIn("M2C_UNK", code)
++        self.assertNotIn("_storage", self.translate(enabled=False, body=body))
++        for offset in (0, 4, 28, 32, 36, -4):
++            with self.subTest(offset=offset):
++                outside = body.replace("addi r3,r1,8", f"addi r3,r1,{offset}")
++                self.assertNotIn("_storage", self.translate(body=outside))
++
+     @unittest.skipUnless(shutil.which("clang"), "Clang required for raw C syntax checks")
+     def test_raw_generated_storage_compiles_without_missing_locals(self):
+-        code = self.translate()
++        self.check_compiles(self.translate())
++        body = BODY.replace("lwz r3,8(r1)\nlwz r4,12(r1)\nadd r3,r3,r4", "li r3,0")
++        self.check_compiles(self.translate(body=body))
++
++    def check_compiles(self, code):
+         with tempfile.TemporaryDirectory() as directory:
+             source = Path(directory) / "draft.c"
+             source.write_text("typedef unsigned char u8; typedef signed char s8;\n"

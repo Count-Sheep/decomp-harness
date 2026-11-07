@@ -1,0 +1,473 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1233,6 +1233,18 @@
+                 return expr
+         return self
+ 
++    def pointer_offset(self) -> Optional[Tuple[Expression, Expression, int]]:
++        if self.op not in ("+", "-"):
++            return None
++        base, offset = late_unwrap(self.left), late_unwrap(self.right)
++        if self.op == "+" and offset.type.is_pointer_or_array() and not base.type.is_pointer_or_array():
++            base, offset = offset, base
++        if not base.type.is_pointer_or_array() or offset.type.is_pointer_or_array():
++            return None
++        target = base.type.decay().get_pointer_target()
++        size = target.get_size_bytes() if target else None
++        return (base, offset, size) if size else None
++
+     def format(self, fmt: Formatter) -> str:
+         left_expr = late_unwrap(self.left)
+         right_expr = late_unwrap(self.right)
+@@ -1240,6 +1252,17 @@
+         adj = self.normalize_for_formatting()
+         if adj is not self:
+             return adj.format(fmt)
++
++        pointer = self.pointer_offset()
++        if pointer is not None:
++            base, offset, size = pointer
++            # Register arithmetic uses bytes; C pointer arithmetic uses elements.
++            if isinstance(offset, Literal) and size and offset.value % size == 0:
++                elements = Literal(offset.value // size, type=Type.s32())
++                return f"({base.format(fmt)} {self.op} {elements.format(fmt)})"
++            if size != 1:
++                pointer_type = base.type.decay().format(fmt)
++                return f"(({pointer_type}) ((char *) {base.format(fmt)} {self.op} {offset.format(fmt)}))"
+ 
+         if (
+             self.is_comparison()
+@@ -2898,6 +2921,13 @@
+     source = late_unwrap(source)
+     if isinstance(source, BinaryOp) and source.op in COMPOUND_ASSIGNMENT_OPS:
+         source = source.normalize_for_formatting()
++        pointer = source.pointer_offset()
++        if pointer is not None:
++            base, offset, size = pointer
++            if is_dest(base) and isinstance(offset, Literal) and size and offset.value % size == 0:
++                elements = Literal(offset.value // size, type=Type.s32())
++                return f"{dest.format(fmt)} {source.op}= {format_expr(elements, fmt)};"
++            return f"{dest.format(fmt)} = {format_expr(source, fmt)};"
+         rhs = None
+         if is_dest(late_unwrap(source.left)):
+             rhs = source.right
+diff --git a/tests/end_to_end/array-access/agbcc-o2-out.c b/tests/end_to_end/array-access/agbcc-o2-out.c
+--- a/tests/end_to_end/array-access/agbcc-o2-out.c
++++ b/tests/end_to_end/array-access/agbcc-o2-out.c
+@@ -1,7 +1,7 @@
+ void test(struct A *a, s32 b) {
+     glob = (s32) a->array[b];
+     glob = (s32) &a->array[b];
+-    glob = *(&a->array2[0].x + (b * 8));
++    glob = *((s32 *) ((char *) &a->array2[0].x + (b * 8)));
+     glob = (s32) &a->array2[b].x;
+     glob = a[b].y;
+     glob = a->array2[3].x;
+diff --git a/tests/end_to_end/arrays/mwcc-o4p-out.c b/tests/end_to_end/arrays/mwcc-o4p-out.c
+--- a/tests/end_to_end/arrays/mwcc-o4p-out.c
++++ b/tests/end_to_end/arrays/mwcc-o4p-out.c
+@@ -9,5 +9,5 @@
+     temp_r10 = arg0 * 4;
+     sp14 = $$21;
+     sp18 = (u16) $$21;
+-    return globalArray[arg0] + (((s8) *(&sp14 + arg0) * *(arg1 + temp_r10)) + (arg2 + temp_r10)->unk4);
++    return globalArray[arg0] + (((s8) *((s32 *) ((char *) &sp14 + arg0)) * *(arg1 + temp_r10)) + (arg2 + temp_r10)->unk4);
+ }
+diff --git a/tests/end_to_end/custom_stack/agbcc-o2-out.c b/tests/end_to_end/custom_stack/agbcc-o2-out.c
+--- a/tests/end_to_end/custom_stack/agbcc-o2-out.c
++++ b/tests/end_to_end/custom_stack/agbcc-o2-out.c
+@@ -23,7 +23,7 @@
+     s32 temp_r5;
+ 
+     frob(&spC);
+-    frob(&sp0 + 0xE);
++    frob((s32 *) ((char *) &sp0 + 0xE));
+     frob(&sp10);
+     frob(&sp14);
+     frob(&sp0);
+diff --git a/tests/end_to_end/flexible-array-members/agbcc-o2-out.c b/tests/end_to_end/flexible-array-members/agbcc-o2-out.c
+--- a/tests/end_to_end/flexible-array-members/agbcc-o2-out.c
++++ b/tests/end_to_end/flexible-array-members/agbcc-o2-out.c
+@@ -1,3 +1,3 @@
+ s32 test(struct A *a, struct C *c, s32 i) {
+-    return a->ys[i] + *(&c->bs[0].y + (i * 8));
++    return a->ys[i] + *((s32 *) ((char *) &c->bs[0].y + (i * 8)));
+ }
+diff --git a/tests/end_to_end/phi-recursive-struct/test-out.c b/tests/end_to_end/phi-recursive-struct/test-out.c
+--- a/tests/end_to_end/phi-recursive-struct/test-out.c
++++ b/tests/end_to_end/phi-recursive-struct/test-out.c
+@@ -11,6 +11,6 @@
+             foo(var_s0->unk2004);
+         }
+         var_s1 += 1;
+-        var_s0 += 0xC;
++        var_s0 = (SomeStruct *) ((char *) var_s0 + 0xC);
+     } while (var_s1 < 5);
+ }
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/struct-context.c b/tests/end_to_end/ppc-pointer-byte-offsets/struct-context.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/struct-context.c
+@@ -0,0 +1,4 @@
++struct Entry { unsigned int words[16]; };
++struct Entry *test(struct Entry *cursor, unsigned int count) {
++    return cursor;
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop-flags.txt b/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context struct-context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop-out.c b/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop-out.c
+@@ -0,0 +1,14 @@
++struct Entry *test(struct Entry *cursor, u32 count) {
++    struct Entry *var_r3;
++    u32 var_r4;
++
++    var_r3 = cursor;
++    var_r4 = count;
++    if ((s32) var_r4 > 0) {
++        do {
++            var_r3 += 1;
++            var_r4 -= 1;
++        } while ((s32) var_r4 > 0);
++    }
++    return var_r3;
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop.s b/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/struct-loop.s
+@@ -0,0 +1,12 @@
++.text
++.fn test, global
++cmpwi r4, 0
++ble .L_return
++.L_loop:
++addi r3, r3, 0x40
++addi r4, r4, -1
++cmpwi r4, 0
++bgt .L_loop
++.L_return:
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-context.c b/tests/end_to_end/ppc-pointer-byte-offsets/word-context.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-context.c
+@@ -0,0 +1,3 @@
++unsigned int *test(unsigned int *cursor, unsigned int count) {
++    return cursor;
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic-flags.txt b/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context word-context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic-out.c b/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic-out.c
+@@ -0,0 +1,3 @@
++u32 *test(u32 *cursor, u32 count) {
++    return (u32 *) ((char *) cursor + count);
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic.s b/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-dynamic.s
+@@ -0,0 +1,5 @@
++.text
++.fn test, global
++add r3, r3, r4
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-loop-flags.txt b/tests/end_to_end/ppc-pointer-byte-offsets/word-loop-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-loop-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context word-context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-loop-out.c b/tests/end_to_end/ppc-pointer-byte-offsets/word-loop-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-loop-out.c
+@@ -0,0 +1,14 @@
++u32 *test(u32 *cursor, u32 count) {
++    u32 *var_r3;
++    u32 var_r4;
++
++    var_r3 = cursor;
++    var_r4 = count;
++    if ((s32) var_r4 > 0) {
++        do {
++            var_r3 += 1;
++            var_r4 -= 1;
++        } while ((s32) var_r4 > 0);
++    }
++    return var_r3;
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-loop.s b/tests/end_to_end/ppc-pointer-byte-offsets/word-loop.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-loop.s
+@@ -0,0 +1,12 @@
++.text
++.fn test, global
++cmpwi r4, 0
++ble .L_return
++.L_loop:
++addi r3, r3, 4
++addi r4, r4, -1
++cmpwi r4, 0
++bgt .L_loop
++.L_return:
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index-flags.txt b/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context word-context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index-out.c b/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index-out.c
+@@ -0,0 +1,3 @@
++u32 *test(u32 *cursor, u32 count) {
++    return (u32 *) ((char *) cursor + ((count * 4) & 0x3FFFC));
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index.s b/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-masked-index.s
+@@ -0,0 +1,6 @@
++.text
++.fn test, global
++rlwinm r4, r4, 2, 14, 29
++add r3, r3, r4
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-partial-flags.txt b/tests/end_to_end/ppc-pointer-byte-offsets/word-partial-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-partial-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context word-context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-partial-out.c b/tests/end_to_end/ppc-pointer-byte-offsets/word-partial-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-partial-out.c
+@@ -0,0 +1,3 @@
++u32 *test(u32 *cursor, u32 count) {
++    return (u32 *) ((char *) cursor + 2);
++}
+diff --git a/tests/end_to_end/ppc-pointer-byte-offsets/word-partial.s b/tests/end_to_end/ppc-pointer-byte-offsets/word-partial.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-pointer-byte-offsets/word-partial.s
+@@ -0,0 +1,5 @@
++.text
++.fn test, global
++addi r3, r3, 2
++blr
++.endfn test
+diff --git a/tests/end_to_end/sh-direct-register-memory/sh2-gcc-o2-out.c b/tests/end_to_end/sh-direct-register-memory/sh2-gcc-o2-out.c
+--- a/tests/end_to_end/sh-direct-register-memory/sh2-gcc-o2-out.c
++++ b/tests/end_to_end/sh-direct-register-memory/sh2-gcc-o2-out.c
+@@ -34,7 +34,7 @@
+     s16 *temp_r1;
+ 
+     temp_r1 = *ptr;
+-    *ptr = temp_r1 + 2;
++    *ptr = temp_r1 + 1;
+     return *temp_r1;
+ }
+ 
+@@ -42,7 +42,7 @@
+     s32 *temp_r1;
+ 
+     temp_r1 = *ptr;
+-    *ptr = temp_r1 + 4;
++    *ptr = temp_r1 + 1;
+     return *temp_r1;
+ }
+ 
+@@ -57,7 +57,7 @@
+ void test_storew_predec(s16 **ptr, s16 value) {
+     s16 *temp_r1;
+ 
+-    temp_r1 = *ptr - 2;
++    temp_r1 = *ptr - 1;
+     *temp_r1 = value;
+     *ptr = temp_r1;
+ }
+@@ -65,7 +65,7 @@
+ void test_storel_predec(s32 **ptr, s32 value) {
+     s32 *temp_r1;
+ 
+-    temp_r1 = *ptr - 4;
++    temp_r1 = *ptr - 1;
+     *temp_r1 = value;
+     *ptr = temp_r1;
+ }
+diff --git a/tests/end_to_end/sh-writeback-non-r15/sh2-gcc-o2-out.c b/tests/end_to_end/sh-writeback-non-r15/sh2-gcc-o2-out.c
+--- a/tests/end_to_end/sh-writeback-non-r15/sh2-gcc-o2-out.c
++++ b/tests/end_to_end/sh-writeback-non-r15/sh2-gcc-o2-out.c
+@@ -2,14 +2,14 @@
+     s32 *temp_r1;
+ 
+     temp_r1 = *ptr;
+-    *ptr = temp_r1 + 4;
++    *ptr = temp_r1 + 1;
+     return *temp_r1;
+ }
+ 
+ void test_storel_predec(s32 **ptr, s32 value) {
+     s32 *temp_r1;
+ 
+-    temp_r1 = *ptr - 4;
++    temp_r1 = *ptr - 1;
+     *temp_r1 = value;
+     *ptr = temp_r1;
+ }
+@@ -25,7 +25,7 @@
+ s16 test_loadw_predec(s16 **ptr) {
+     s16 *temp_r1;
+ 
+-    temp_r1 = *ptr - 2;
++    temp_r1 = *ptr - 1;
+     *ptr = temp_r1;
+     return *temp_r1;
+ }
+diff --git a/tests/end_to_end/void_pointers/agbcc-o2-out.c b/tests/end_to_end/void_pointers/agbcc-o2-out.c
+--- a/tests/end_to_end/void_pointers/agbcc-o2-out.c
++++ b/tests/end_to_end/void_pointers/agbcc-o2-out.c
+@@ -5,7 +5,7 @@
+     s32 temp_r2;
+ 
+     sp0 = x->unk0;
+-    sp4 = x + 0x28;
++    sp4 = x + 0xA;
+     sp8 = x->unk190;
+     sp0 = *func_00400090(&sp0) + sp0;
+     sp4 = func_00400090(&sp4);
+diff --git a/tests/end_to_end/void_pointers/irix-g-out.c b/tests/end_to_end/void_pointers/irix-g-out.c
+--- a/tests/end_to_end/void_pointers/irix-g-out.c
++++ b/tests/end_to_end/void_pointers/irix-g-out.c
+@@ -4,7 +4,7 @@
+     s32 sp24;
+ 
+     sp2F = (s8) x->unk0;
+-    sp28 = x + 0x28;
++    sp28 = x + 0xA;
+     sp24 = x->unk190;
+     sp2F += *func_00400090(&sp2F);
+     sp28 = func_00400090(&sp28);
+diff --git a/tests/end_to_end/void_pointers/irix-o2-out.c b/tests/end_to_end/void_pointers/irix-o2-out.c
+--- a/tests/end_to_end/void_pointers/irix-o2-out.c
++++ b/tests/end_to_end/void_pointers/irix-o2-out.c
+@@ -4,7 +4,7 @@
+     s32 sp1C;
+     s32 temp_t4;
+ 
+-    sp20 = x + 0x28;
++    sp20 = x + 0xA;
+     sp27 = (s8) x->unk0;
+     sp1C = x->unk190;
+     sp27 += *func_00400090(&sp27);
+diff --git a/tests/end_to_end/void_pointers/mwcc-o4p-out.c b/tests/end_to_end/void_pointers/mwcc-o4p-out.c
+--- a/tests/end_to_end/void_pointers/mwcc-o4p-out.c
++++ b/tests/end_to_end/void_pointers/mwcc-o4p-out.c
+@@ -3,7 +3,7 @@
+     s32 *sp10;
+     s32 spC;
+ 
+-    sp10 = x + 0x28;
++    sp10 = x + 0xA;
+     sp14 = (s8) x->unk0;
+     spC = x->unk190;
+     sp14 = (u8) sp14 + *func_00400090(&sp14);
+diff --git a/tests/end_to_end/weird-asm/test-out.c b/tests/end_to_end/weird-asm/test-out.c
+--- a/tests/end_to_end/weird-asm/test-out.c
++++ b/tests/end_to_end/weird-asm/test-out.c
+@@ -4,5 +4,5 @@
+ static s16 special !@#$%^chars[2] = { 0, 0x1234 };  /* const */
+ 
+ void *test(void) {
+-    return &special !@#$%^chars[0x1233FFFF] + more special;
++    return (s16 *) ((char *) &special !@#$%^chars[0x1233FFFF] + more special);
+ }
+diff --git a/tests/unit/test_pointer_offsets.py b/tests/unit/test_pointer_offsets.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_pointer_offsets.py
+@@ -0,0 +1,61 @@
++import unittest
++
++from m2c.options import Formatter
++from m2c.translate import BinaryOp, GlobalSymbol, Literal, format_assignment
++from m2c.types import Type
++
++
++class TestPointerOffsets(unittest.TestCase):
++    def test_literal_offsets_are_converted_from_bytes_without_changing_the_ir(self):
++        for element in (Type.u8(), Type.u16(), Type.u32(), Type.u64()):
++            size = element.get_size_bytes()
++            pointer = GlobalSymbol('cursor', Type.ptr(element))
++            for count in (-3, -1, 0, 1, 3):
++                with self.subTest(size=size, count=count):
++                    offset = Literal(count * size)
++                    expr = BinaryOp(pointer, '+', offset, pointer.type)
++                    formatted = expr.format(Formatter())
++                    op, magnitude = ('-', -count) if count < 0 else ('+', count)
++                    self.assertEqual(formatted, f'(cursor {op} {magnitude})')
++                    self.assertEqual(format_assignment(pointer, expr, Formatter()), f'cursor {op}= {magnitude};')
++                    self.assertEqual(expr.right.value, count * size)
++
++    def test_commutative_offsets_and_subtraction_preserve_byte_steps(self):
++        pointer = GlobalSymbol('cursor', Type.ptr(Type.u32()))
++        addition = BinaryOp(Literal(8), '+', pointer, pointer.type)
++        subtraction = BinaryOp(pointer, '-', Literal(12), pointer.type)
++        self.assertEqual(addition.format(Formatter()), '(cursor + 2)')
++        self.assertEqual(format_assignment(pointer, addition, Formatter()), 'cursor += 2;')
++        self.assertEqual(subtraction.format(Formatter()), '(cursor - 3)')
++
++    def test_partial_and_dynamic_offsets_keep_byte_arithmetic(self):
++        pointer = GlobalSymbol('cursor', Type.ptr(Type.u32()))
++        for offset in (Literal(2), GlobalSymbol('bytes', Type.u32())):
++            expr = BinaryOp(pointer, '+', offset, pointer.type)
++            formatted = expr.format(Formatter())
++            self.assertIn('(char *) cursor +', formatted)
++            self.assertIn('u32 *', formatted)
++            self.assertNotIn('cursor +=', format_assignment(pointer, expr, Formatter()))
++
++    def test_late_pointer_types_and_array_decay_use_the_final_element_size(self):
++        pointer = GlobalSymbol('cursor', Type.intptr())
++        expr = BinaryOp(pointer, '+', Literal(8), Type.intptr())
++        self.assertTrue(pointer.type.unify(Type.ptr(Type.u32())))
++        self.assertEqual(expr.format(Formatter()), '(cursor + 2)')
++        array = GlobalSymbol('values', Type.array(Type.u16(), 4))
++        self.assertEqual(BinaryOp(array, '+', Literal(2), Type.ptr()).format(Formatter()), '(values + 1)')
++
++    def test_integer_addition_and_character_pointer_steps_are_unchanged(self):
++        integer = GlobalSymbol('count', Type.s32())
++        expr = BinaryOp(integer, '+', Literal(4), integer.type)
++        self.assertEqual(expr.format(Formatter()), '(count + 4)')
++        self.assertEqual(format_assignment(integer, expr, Formatter()), 'count += 4;')
++        pointer = GlobalSymbol('cursor', Type.ptr(Type.u8()))
++        offset = GlobalSymbol('bytes', Type.s32())
++        self.assertEqual(BinaryOp(pointer, '+', offset, pointer.type).format(Formatter()), '(cursor + bytes)')
++        unknown = GlobalSymbol('opaque', Type.ptr())
++        self.assertEqual(BinaryOp(unknown, '+', Literal(4), unknown.type).format(Formatter()), '(opaque + 4)')
++
++
++if __name__ == '__main__':
++    unittest.main()

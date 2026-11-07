@@ -1,0 +1,366 @@
+diff --git a/m2c/c_types.py b/m2c/c_types.py
+--- a/m2c/c_types.py
++++ b/m2c/c_types.py
+@@ -100,7 +100,7 @@
+ @dataclass(eq=False)
+ class TypeMap:
+     # Change VERSION if TypeMap changes to invalidate all preexisting caches
+-    VERSION: ClassVar[int] = 11
++    VERSION: ClassVar[int] = 12
+ 
+     source_hash: str
+     base_struct_align: int
+@@ -111,6 +111,7 @@
+     var_types: Dict[str, CType] = field(default_factory=dict)
+     vars_with_initializers: Set[str] = field(default_factory=set)
+     functions: Dict[str, Function] = field(default_factory=dict)
++    local_declarations: Dict[str, Dict[str, CType]] = field(default_factory=dict)
+     structs: Dict[Union[str, StructUnion], Struct] = field(default_factory=dict)
+     struct_typedefs: Dict[Union[str, StructUnion], TypeDecl] = field(
+         default_factory=dict
+@@ -963,7 +964,8 @@
+                     typemap.var_types[node.decl.name] = type_from_global_decl(node.decl)
+                 if node.decl.name != context_function:
+                     return
+-                # Only outer-body externs are unambiguous for the selected target.
++                # Function declarations without storage have implicit extern linkage.
++                # Only the selected function's outer scope supplies symbol types.
+                 items = node.body.block_items or []
+                 local_types = {item.name for item in items if isinstance(item, ca.Typedef)}
+                 local_tags = {
+@@ -984,7 +986,11 @@
+                     visit_Union = visit_Struct
+ 
+                 for item in items:
+-                    if not isinstance(item, ca.Decl) or "extern" not in item.storage:
++                    if not isinstance(item, ca.Decl):
++                        continue
++                    if "extern" not in item.storage and not (
++                        isinstance(item.type, FuncDecl) and not item.storage
++                    ):
+                         continue
+                     if item.name is None or item.name in typemap.var_types or item.name in typemap.functions:
+                         continue
+@@ -993,6 +999,9 @@
+                     if dependencies.found:
+                         continue
+                     self.visit_Decl(item)
++                    typemap.local_declarations.setdefault(node.decl.name, {})[item.name] = (
++                        type_from_global_decl(item)
++                    )
+                     if isinstance(item.type, FuncDecl):
+                         fn = parse_function(item.type)
+                         assert fn is not None
+@@ -1021,7 +1030,7 @@
+ 
+ 
+ def type_to_string(type: CType, name: str = "") -> str:
+-    if isinstance(type, TypeDecl) and isinstance(
++    if not name and isinstance(type, TypeDecl) and isinstance(
+         type.type, (ca.Struct, ca.Union, ca.Enum)
+     ):
+         if isinstance(type.type, ca.Struct):
+diff --git a/m2c/if_statements.py b/m2c/if_statements.py
+--- a/m2c/if_statements.py
++++ b/m2c/if_statements.py
+@@ -13,6 +13,7 @@
+     Union,
+ )
+ 
++from .c_types import type_to_string
+ from .flow_graph import (
+     BasicNode,
+     ConditionalNode,
+@@ -1474,6 +1475,17 @@
+         # Format the body first, because this can result in additional type inferencce
+         formatted_body = body.format(fmt)
+ 
++        global_info = function_info.stack_info.global_info
++        referenced = {sym.c_symbol_name for sym in global_info.global_symbol_map.values()
++                      if sym.is_referenced}
++        for name, ctype in global_info.typemap.local_declarations.get(fn_name, {}).items():
++            if name not in referenced:
++                continue
++            qualifier = "" if name in global_info.typemap.functions else "extern "
++            declaration = qualifier + type_to_string(ctype, name)
++            function_lines.append(SimpleStatement(f"{declaration};").format(fmt))
++            any_decl = True
++
+         local_vars = function_info.stack_info.local_vars
+         # GCC's stack is ordered low-to-high (e.g. `int sp10; int sp14;`)
+         # IDO's and MWCC's stack is ordered high-to-low (e.g. `int sp14; int sp10;`)
+diff --git a/tests/end_to_end/complicated_context/irix-o2-typemap-out.c b/tests/end_to_end/complicated_context/irix-o2-typemap-out.c
+--- a/tests/end_to_end/complicated_context/irix-o2-typemap-out.c
++++ b/tests/end_to_end/complicated_context/irix-o2-typemap-out.c
+@@ -1,7 +1,7 @@
+ Variables:
+ int globali;
+ float globalf;
+-struct SubStruct;
++struct SubStruct extern_inner_struct_field;
+ void func_decl(void);
+ short test(struct SomeStruct *, unsigned char, union SomeUnion, ...);
+ int fixed_addr_sym;
+diff --git a/tests/end_to_end/ppc-context-aggregate-externs/context.c b/tests/end_to_end/ppc-context-aggregate-externs/context.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-aggregate-externs/context.c
+@@ -0,0 +1,9 @@
++struct Entry { int value; };
++union Value { int word; float real; };
++enum Mode { OFF, ON };
++int test(void) {
++    extern const struct Entry entry;
++    extern union Value value;
++    extern enum Mode mode;
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-context-aggregate-externs/manual-flags.txt b/tests/end_to_end/ppc-context-aggregate-externs/manual-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-aggregate-externs/manual-flags.txt
+@@ -0,0 +1 @@
++--target ppc-mwcc-c --context context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-context-aggregate-externs/manual-out.c b/tests/end_to_end/ppc-context-aggregate-externs/manual-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-aggregate-externs/manual-out.c
+@@ -0,0 +1,7 @@
++s32 test(void) {
++    extern const struct Entry entry;
++    extern union Value value;
++    extern enum Mode mode;
++
++    return entry.value + value.word + mode;
++}
+diff --git a/tests/end_to_end/ppc-context-aggregate-externs/manual.s b/tests/end_to_end/ppc-context-aggregate-externs/manual.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-aggregate-externs/manual.s
+@@ -0,0 +1,12 @@
++.text
++.fn test, global
++lis r4, entry@ha
++lwz r3, entry@l(r4)
++lis r4, value@ha
++lwz r4, value@l(r4)
++add r3, r3, r4
++lis r4, mode@ha
++lwz r4, mode@l(r4)
++add r3, r3, r4
++blr
++.endfn test
+diff --git a/tests/end_to_end/ppc-context-externs/manual-out.c b/tests/end_to_end/ppc-context-externs/manual-out.c
+--- a/tests/end_to_end/ppc-context-externs/manual-out.c
++++ b/tests/end_to_end/ppc-context-externs/manual-out.c
+@@ -1,3 +1,6 @@
+ s32 test(void) {
++    int helper(int);
++    extern int counter;
++
+     return helper(counter);
+ }
+diff --git a/tests/end_to_end/ppc-context-implicit-call-args/context.c b/tests/end_to_end/ppc-context-implicit-call-args/context.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-call-args/context.c
+@@ -0,0 +1,8 @@
++int test(void *context, unsigned int owner, unsigned int enemy) {
++    int compare(void *, unsigned int, unsigned int);
++    return compare(context, owner, enemy);
++}
++int unrelated(void) {
++    int compare(void *, unsigned int);
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-context-implicit-call-args/manual-flags.txt b/tests/end_to_end/ppc-context-implicit-call-args/manual-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-call-args/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-context-implicit-call-args/manual-out.c b/tests/end_to_end/ppc-context-implicit-call-args/manual-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-call-args/manual-out.c
+@@ -0,0 +1,5 @@
++s32 test(void *context, u32 owner, u32 enemy) {
++    int compare(void *, unsigned int, unsigned int);
++
++    return compare(context, owner, enemy);
++}
+diff --git a/tests/end_to_end/ppc-context-implicit-call-args/manual.s b/tests/end_to_end/ppc-context-implicit-call-args/manual.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-call-args/manual.s
+@@ -0,0 +1,4 @@
++.text
++.fn test, global
++b compare
++.endfn test
+diff --git a/tests/end_to_end/ppc-context-implicit-prototypes/context.c b/tests/end_to_end/ppc-context-implicit-prototypes/context.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-prototypes/context.c
+@@ -0,0 +1,9 @@
++struct Entry { int key; int value; };
++int test(unsigned int index) {
++    struct Entry *lookup(unsigned int);
++    return lookup(index)->value;
++}
++int unrelated(void) {
++    float lookup(double);
++    return 0;
++}
+diff --git a/tests/end_to_end/ppc-context-implicit-prototypes/manual-flags.txt b/tests/end_to_end/ppc-context-implicit-prototypes/manual-flags.txt
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-prototypes/manual-flags.txt
+@@ -0,0 +1 @@
++-t ppc-mwcc-c --context context.c --no-cache --no-unk-inference --valid-syntax
+diff --git a/tests/end_to_end/ppc-context-implicit-prototypes/manual-out.c b/tests/end_to_end/ppc-context-implicit-prototypes/manual-out.c
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-prototypes/manual-out.c
+@@ -0,0 +1,5 @@
++s32 test(u32 index) {
++    struct Entry *lookup(unsigned int);
++
++    return lookup(index)->value;
++}
+diff --git a/tests/end_to_end/ppc-context-implicit-prototypes/manual.s b/tests/end_to_end/ppc-context-implicit-prototypes/manual.s
+new file mode 100644
+--- /dev/null
++++ b/tests/end_to_end/ppc-context-implicit-prototypes/manual.s
+@@ -0,0 +1,12 @@
++.text
++.fn test, global
++stwu r1, -0x10(r1)
++mflr r0
++stw r0, 0x14(r1)
++bl lookup
++lwz r3, 4(r3)
++lwz r0, 0x14(r1)
++mtlr r0
++addi r1, r1, 0x10
++blr
++.endfn test
+diff --git a/tests/unit/test_context_externs.py b/tests/unit/test_context_externs.py
+--- a/tests/unit/test_context_externs.py
++++ b/tests/unit/test_context_externs.py
+@@ -3,7 +3,7 @@
+ import unittest
+ 
+ from m2c.arch_ppc import PpcArch
+-from m2c.c_types import build_typemap, to_c
++from m2c.c_types import build_typemap, to_c, type_to_string
+ 
+ 
+ class TestContextExterns(unittest.TestCase):
+@@ -33,6 +33,7 @@
+         self.assertEqual(to_c(types.functions['clock_value'].ret_type), 'long long')
+         self.assertEqual(types.functions['clock_value'].params, [])
+         self.assertEqual(to_c(types.var_types['counter']), 'int')
++        self.assertEqual(set(types.local_declarations['first']), {'clock_value', 'counter'})
+         for name in ('local', 'local_static', 'nested'):
+             self.assertNotIn(name, types.var_types)
+ 
+@@ -69,6 +70,98 @@
+         self.assertNotIn('hidden_value', types.var_types)
+         self.assertNotIn('hidden_shape', types.var_types)
+ 
++    def test_implicit_extern_prototypes_preserve_return_and_parameter_types(self):
++        self.path.write_text('''
++struct Entry { int key; int value; };
++int first(void) {
++    struct Entry *lookup(unsigned int);
++    unsigned short count(void *, unsigned int *, unsigned int);
++    double sample(float);
++    int (*callback)(void);
++    int local;
++    { float nested(void); }
++    return 0;
++}
++int second(void) {
++    float lookup(double);
++    return 0;
++}
++''')
++        types = build_typemap([self.path], self.arch, False, context_function='first')
++        self.assertEqual(to_c(types.functions['lookup'].ret_type), 'struct Entry *')
++        self.assertEqual([to_c(p.type) for p in types.functions['lookup'].params], ['unsigned int'])
++        self.assertEqual(to_c(types.functions['count'].ret_type), 'unsigned short')
++        self.assertEqual([to_c(p.type) for p in types.functions['count'].params],
++                         ['void *', 'unsigned int *', 'unsigned int'])
++        self.assertEqual(to_c(types.functions['sample'].ret_type), 'double')
++        self.assertEqual([to_c(p.type) for p in types.functions['sample'].params], ['float'])
++        self.assertEqual(set(types.local_declarations['first']), {'lookup', 'count', 'sample'})
++        for name in ('callback', 'local', 'nested'):
++            self.assertNotIn(name, types.var_types)
++            self.assertNotIn(name, types.functions)
++
++    def test_implicit_extern_prototypes_respect_target_scope_and_global_types(self):
++        self.path.write_text('''
++int existing(void);
++int first(void) {
++    long value(void);
++    float existing(void);
++    return 0;
++}
++int second(void) {
++    float value(double);
++    return 0;
++}
++''')
++        first = build_typemap([self.path], self.arch, True, context_function='first')
++        second = build_typemap([self.path], self.arch, True, context_function='second')
++        default = build_typemap([self.path], self.arch, False)
++        self.assertEqual(to_c(first.functions['value'].ret_type), 'long')
++        self.assertEqual(first.functions['value'].params, [])
++        self.assertEqual(to_c(second.functions['value'].ret_type), 'float')
++        self.assertEqual([to_c(p.type) for p in second.functions['value'].params], ['double'])
++        self.assertEqual(to_c(first.functions['existing'].ret_type), 'int')
++        self.assertNotIn('existing', first.local_declarations['first'])
++        self.assertNotIn('value', default.functions)
++
++    def test_implicit_extern_prototypes_with_private_types_are_excluded(self):
++        self.path.write_text('''
++struct Entry { int key; };
++int first(void) {
++    typedef double Private;
++    struct Entry { float value; };
++    Private private_result(void);
++    int private_parameter(Private);
++    struct Entry *private_tag(void);
++    int ordinary(int);
++    return 0;
++}
++''')
++        types = build_typemap([self.path], self.arch, False, context_function='first')
++        for name in ('private_result', 'private_parameter', 'private_tag'):
++            self.assertNotIn(name, types.functions)
++            self.assertNotIn(name, types.var_types)
++        self.assertEqual(to_c(types.functions['ordinary'].ret_type), 'int')
++
++    def test_named_aggregate_externs_retain_names_and_qualifiers(self):
++        self.path.write_text('''
++struct Entry { int value; };
++union Value { int word; float real; };
++enum Mode { OFF, ON };
++int first(void) {
++    extern const struct Entry entry;
++    extern union Value value;
++    extern enum Mode mode;
++    return 0;
++}
++''')
++        types = build_typemap([self.path], self.arch, False, context_function='first')
++        declarations = types.local_declarations['first']
++        self.assertEqual(type_to_string(declarations['entry'], 'entry'), 'const struct Entry entry')
++        self.assertEqual(type_to_string(declarations['value'], 'value'), 'union Value value')
++        self.assertEqual(type_to_string(declarations['mode'], 'mode'), 'enum Mode mode')
++        self.assertEqual(type_to_string(declarations['entry']), 'struct Entry')
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

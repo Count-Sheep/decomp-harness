@@ -1,0 +1,151 @@
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 824280c..6247101 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -1339,7 +1339,7 @@ class BinaryOp(Condition):
+         if pointer is not None:
+             base, offset, size = pointer
+             # Register arithmetic uses bytes; C pointer arithmetic uses elements.
+-            if not size:
++            if not size or (fmt.valid_syntax and base.type.is_recursive_pointer()):
+                 result_type = (self.type if self.type.data().kind in
+                                (TypeData.K_INT, TypeData.K_PTR, TypeData.K_INTPTR) else base.type.decay())
+                 return f"(({result_type.format(fmt)}) ((char *) {base.format(fmt)} {self.op} {offset.format(fmt)}))"
+@@ -1775,7 +1775,8 @@ class StructAccess(Expression):
+ 
+         field_path: Optional[AccessPath] = self.late_field_path()
+ 
+-        if fmt.valid_syntax and fmt.explicit_field_access and field_path is None:
++        if fmt.valid_syntax and ((fmt.explicit_field_access and field_path is None)
++                                 or var.type.is_recursive_pointer()):
+             # Even at offset zero the address may be an integer-valued register
+             # expression. Preserve the load/store type instead of emitting *int.
+             pointer = Type.ptr(self.type).format(fmt)
+@@ -1831,6 +1832,8 @@ class ArrayAccess(Expression):
+     def format(self, fmt: Formatter) -> str:
+         base = parenthesize_for_struct_access(self.ptr, fmt)
+         index = format_expr(self.index, fmt)
++        if fmt.valid_syntax and self.ptr.type.is_recursive_pointer():
++            base = f"(({Type.ptr(self.type).format(fmt)}) {base})"
+         return f"{base}[{index}]"
+ 
+ 
+@@ -3051,7 +3054,8 @@ def format_assignment(
+         pointer = source.pointer_offset(include_unsized=fmt.valid_syntax)
+         if pointer is not None:
+             base, offset, size = pointer
+-            if is_dest(base) and isinstance(offset, Literal) and size and offset.value % size == 0:
++            if (is_dest(base) and isinstance(offset, Literal) and size and offset.value % size == 0
++                    and not (fmt.valid_syntax and base.type.is_recursive_pointer())):
+                 elements = Literal(offset.value // size, type=Type.s32())
+                 return f"{dest.format(fmt)} {source.op}= {format_expr(elements, fmt)};"
+             return f"{dest.format(fmt)} = {format_expr(source, fmt)};"
+diff --git a/m2c/types.py b/m2c/types.py
+index 7d0f19c..d52fbbf 100644
+--- a/m2c/types.py
++++ b/m2c/types.py
+@@ -314,6 +314,17 @@ class Type:
+     def is_pointer(self) -> bool:
+         return self.data().kind == TypeData.K_PTR
+ 
++    def is_recursive_pointer(self) -> bool:
++        """Whether this node belongs to a pointer-only cycle without a named C type."""
++        start = current = self.data()
++        seen: Set[TypeData] = set()
++        while current.kind == TypeData.K_PTR and current.ptr_to is not None:
++            if current in seen:
++                return current is start
++            seen.add(current)
++            current = current.ptr_to.data()
++        return False
++
+     def is_pointer_or_array(self) -> bool:
+         return self.data().kind in (TypeData.K_PTR, TypeData.K_ARRAY)
+ 
+@@ -709,6 +720,8 @@ class Type:
+         unk_symbol = "M2C_UNK" if fmt.valid_syntax else "?"
+ 
+         data = self.data()
++        if fmt.valid_syntax and self.is_recursive_pointer():
++            return ca.PtrDecl(type=simple_ctype("void"), quals=[])
+         if data in seen:
+             return simple_ctype(unk_symbol)
+         seen.add(data)
+diff --git a/tests/unit/test_recursive_pointer_views.py b/tests/unit/test_recursive_pointer_views.py
+new file mode 100644
+index 0000000..aecf6e9
+--- /dev/null
++++ b/tests/unit/test_recursive_pointer_views.py
+@@ -0,0 +1,72 @@
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from m2c.options import Formatter
++from m2c.translate import ArrayAccess, BinaryOp, GlobalSymbol, Literal, StructAccess, format_assignment
++from m2c.types import Type
++
++
++def recursive_pointer():
++    pointer = Type.ptr()
++    pointer.data().ptr_to = pointer
++    return pointer
++
++
++class TestRecursivePointerViews(unittest.TestCase):
++    def test_only_nodes_in_pointer_cycles_are_opaque(self):
++        pointer = recursive_pointer()
++        fmt = Formatter(valid_syntax=True)
++        self.assertTrue(pointer.is_recursive_pointer())
++        self.assertEqual(pointer.format(fmt), "void *")
++        self.assertEqual(pointer.format(Formatter()), "? *")
++        outer = Type.ptr(pointer)
++        self.assertFalse(outer.is_recursive_pointer())
++        self.assertEqual(outer.format(fmt), "void **")
++        first, second = Type.ptr(), Type.ptr()
++        first.data().ptr_to = second
++        second.data().ptr_to = first
++        self.assertTrue(first.is_recursive_pointer())
++        self.assertTrue(second.is_recursive_pointer())
++        self.assertEqual(first.format(fmt), "void *")
++        self.assertFalse(Type.ptr(Type.s32()).is_recursive_pointer())
++        self.assertFalse(Type.ptr(Type.any()).is_recursive_pointer())
++
++    def test_recursive_loads_and_array_access_keep_pointer_width(self):
++        pointer = recursive_pointer()
++        value = GlobalSymbol("cursor", pointer)
++        fmt = Formatter(valid_syntax=True)
++        access = StructAccess(value, 0, 4, field_path=[0], stack_info=None, type=pointer)
++        self.assertIn("void **", access.format(fmt))
++        self.assertEqual(access.format(Formatter()), "*cursor")
++        self.assertEqual(ArrayAccess(value, Literal(1), pointer).format(fmt), "((void **) cursor)[1]")
++
++    def test_recursive_offsets_never_emit_void_pointer_arithmetic(self):
++        pointer = recursive_pointer()
++        value = GlobalSymbol("cursor", pointer)
++        fmt = Formatter(valid_syntax=True)
++        offset = BinaryOp(value, "+", Literal(8), pointer)
++        self.assertEqual(offset.format(fmt), "((void *) ((char *) cursor + 8))")
++        self.assertNotIn("+=", format_assignment(value, offset, fmt))
++        self.assertEqual(offset.format(Formatter()), "(cursor + 2)")
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for raw C syntax checks")
++    def test_recursive_views_compile_as_powerpc_c89(self):
++        pointer = recursive_pointer()
++        value = GlobalSymbol("cursor", pointer)
++        fmt = Formatter(valid_syntax=True)
++        access = StructAccess(value, 0, 4, field_path=[0], stack_info=None, type=pointer).format(fmt)
++        code = f"void *next(void *cursor) {{ return {access}; }}\n"
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "draft.c"
++            path.write_text(code)
++            run = subprocess.run([shutil.which("clang"), "-target", "powerpc-unknown-none",
++                                  "-std=c89", "-pedantic-errors", "-Werror", "-fsyntax-only", str(path)],
++                                 capture_output=True, text=True, timeout=30)
++            self.assertEqual(run.returncode, 0, code + run.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,140 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -1907,6 +2134,7 @@ class PpcArch(Arch):
+             slot.loc.reg for slot in known_slots if slot.loc.reg is not None
+         }
+         possible_slots: List[AbiArgSlot] = []
++        pending_slots: Dict[str, List[AbiArgSlot]] = {}
+         for slot in candidate_slots:
+             reg = slot.loc.reg
+             if reg is None or reg not in likely_regs:
+@@ -1929,17 +2157,14 @@ class PpcArch(Arch):
+ 
+             valid_extra_regs.add(reg)
+ 
+-            # Skip registers that are untouched from the initial parameter
+-            # list. This is sometimes wrong (can give both false positives
+-            # and negatives), but having a heuristic here is unavoidable
+-            # without access to function signatures, or when dealing with
+-            # varargs functions. Decompiling multiple functions at once
+-            # would help.
+-            # TODO: don't do this in the middle of the argument list
+-            if not likely_regs[reg]:
+-                continue
+-
+-            possible_slots.append(slot)
++            # Only trim unlikely trailing arguments within each register class.
++            # Dropping r3 but keeping r4 would move the r4 value into the r3 ABI
++            # slot when emitted as C. Integer and float prefixes are independent.
++            pending = pending_slots.setdefault(reg.register_name[0], [])
++            pending.append(slot)
++            if likely_regs[reg]:
++                possible_slots.extend(pending)
++                pending.clear()
+ 
+         return Abi(
+             arg_slots=known_slots,
+diff --git a/tests/unit/test_ppc_call_args.py b/tests/unit/test_ppc_call_args.py
+new file mode 100644
+index 0000000..b7ad6fe
+--- /dev/null
++++ b/tests/unit/test_ppc_call_args.py
+@@ -0,0 +1,96 @@
++from contextlib import redirect_stdout
++import io
++from pathlib import Path
++import tempfile
++import unittest
++
++from m2c.arch_ppc import PpcArch
++from m2c.asm_instruction import Register
++from m2c.main import parse_flags, run
++from m2c.types import FunctionParam, FunctionSignature, Type
++
++
++class TestPpcCallArgumentPositions(unittest.TestCase):
++    def translate(self, context):
++        assembly = '''.text
++.fn test, global
++stwu r1, -16(r1)
++mflr r0
++li r4, callbacks@sda21
++stw r0, 20(r1)
++lwz r12, 4(r4)
++mtctr r12
++bctrl
++lwz r0, 20(r1)
++mtlr r0
++addi r1, r1, 16
++blr
++.endfn test
++'''
++        with tempfile.TemporaryDirectory() as name:
++            root = Path(name)
++            (root / 'target.s').write_text(assembly)
++            (root / 'context.c').write_text(context)
++            options = parse_flags(['-t', 'ppc-mwcc-c', '--no-cache', '--no-unk-inference', '--valid-syntax',
++                                   '--context', str(root / 'context.c'), '-f', 'test', str(root / 'target.s')])
++            output = io.StringIO()
++            with redirect_stdout(output):
++                self.assertEqual(run(options), 0)
++            return output.getvalue()
++
++    def slots(self, likely, signature=None):
++        abi = PpcArch.function_abi(signature or FunctionSignature(),
++                                   {Register(name): value for name, value in likely.items()},
++                                   for_call=True)
++        return [slot.loc.reg.register_name for slot in abi.possible_slots]
++
++    def test_skipped_first_argument_cannot_shift_second_argument_into_r3(self):
++        self.assertEqual(self.slots({'r3': False, 'r4': True}), ['r3', 'r4'])
++
++    def test_holes_inside_integer_and_float_prefixes_preserve_register_positions(self):
++        self.assertEqual(self.slots({'r3': True, 'r4': False, 'r5': True, 'r6': False}),
++                         ['r3', 'r4', 'r5'])
++        self.assertEqual(self.slots({'f1': False, 'f2': False, 'f3': True, 'f4': False}),
++                         ['f1', 'f2', 'f3'])
++
++    def test_float_only_call_does_not_invent_integer_arguments(self):
++        self.assertEqual(self.slots({'r3': False, 'r4': False, 'f1': True}), ['f1'])
++
++    def test_missing_register_breaks_inference_rather_than_inventing_a_value(self):
++        self.assertEqual(self.slots({'r4': True}), [])
++        self.assertEqual(self.slots({'r3': True, 'r5': True}), ['r3'])
++        self.assertEqual(self.slots({'f2': True}), [])
++
++    def test_unlikely_trailing_registers_are_not_arguments(self):
++        self.assertEqual(self.slots({'r3': False, 'r4': False}), [])
++        self.assertEqual(self.slots({'r3': True, 'r4': False, 'r5': False}), ['r3'])
++
++    def test_known_nonvariadic_signature_is_authoritative(self):
++        sig = FunctionSignature(return_type=Type.void(), params=[FunctionParam(Type.u32(), 'value')],
++                                params_known=True)
++        abi = PpcArch.function_abi(sig, {Register('r3'): False, Register('r4'): True}, for_call=True)
++        self.assertEqual([slot.loc.reg.register_name for slot in abi.arg_slots], ['r3'])
++        self.assertEqual(abi.possible_slots, [])
++
++    def test_variadic_prefix_is_relative_to_declared_arguments(self):
++        sig = FunctionSignature(return_type=Type.void(), params=[FunctionParam(Type.u32(), 'value')],
++                                params_known=True, is_variadic=True)
++        self.assertEqual(self.slots({'r3': False, 'r4': False, 'r5': True}, sig), ['r4', 'r5'])
++
++    def test_unknown_indirect_callee_keeps_incoming_first_argument(self):
++        output = self.translate('unsigned int callbacks; void test(unsigned int allocation);')
++        self.assertIn('(allocation, &callbacks)', output)
++        self.assertNotIn('4)(&callbacks)', output)
++
++    def test_known_indirect_callee_does_not_infer_address_temporary_as_argument(self):
++        output = self.translate('''
++typedef struct { void (*allocate)(unsigned int); void (*release)(unsigned int); } Hooks;
++extern Hooks callbacks;
++void test(unsigned int allocation);
++''')
++        self.assertIn('callbacks.release(allocation);', output)
++        self.assertNotIn('allocation, &callbacks', output)
++
++
++if __name__ == '__main__':
++    unittest.main()
+

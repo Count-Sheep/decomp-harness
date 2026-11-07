@@ -1,0 +1,127 @@
+diff --git a/m2c/c_types.py b/m2c/c_types.py
+--- a/m2c/c_types.py
++++ b/m2c/c_types.py
+@@ -26,6 +26,7 @@
+ from m2c_pycparser import c_ast as ca
+ from m2c_pycparser.c_ast import ArrayDecl, FuncDecl, IdentifierType, PtrDecl, TypeDecl
+ from m2c_pycparser.c_generator import CGenerator
++from m2c_pycparser.c_lexer import CLexer
+ from m2c_pycparser.c_parser import CParser
+ from m2c_pycparser.plyparser import ParseError
+ 
+@@ -797,9 +798,41 @@
+     return re.sub(r"\\\n", replacer, text, flags=re.MULTILINE)
+ 
+ 
++def remove_mwcc_section_attributes(source: str) -> str:
++    """Ignore section placement for type parsing, retaining all ABI attributes."""
++    if "__declspec" not in source:
++        return source
++
++    def fail(message: str, line: int, column: int) -> None:
++        raise DecompFailure(f"Cannot tokenize C context at line {line}: {message}")
++
++    lexer = CLexer(fail, lambda: None, lambda: None, lambda name: False)
++    lexer.build()
++    lexer.input(source)
++    tokens = []
++    while token := lexer.token():
++        tokens.append(token)
++    ranges = []
++    for index, token in enumerate(tokens):
++        if token.type != "ID" or token.value != "__declspec":
++            continue
++        arguments = tokens[index + 1:index + 5]
++        if (len(arguments) == 4
++                and [argument.type for argument in arguments] == ["LPAREN", "ID", "STRING_LITERAL", "RPAREN"]
++                and arguments[1].value == "section"):
++            ranges.append((token.lexpos, arguments[-1].lexpos + 1))
++    # Preserve coordinates, including newlines and columns, in parser diagnostics.
++    result, cursor = [], 0
++    for start, end in ranges:
++        result.extend((source[cursor:start], "".join("\n" if char == "\n" else " " for char in source[start:end])))
++        cursor = end
++    return "".join(result) + source[cursor:]
++
++
+ def parse_c(
+     source: str, initial_scope: CParserScope
+ ) -> Tuple[ca.FileAST, CParserScope]:
++    source = remove_mwcc_section_attributes(source)
+     # This is a modified version of `CParser.parse()` which initializes `_scope_stack`,
+     # which contains the only stateful part of the parser that needs to be preserved
+     # when parsing multiple files.
+diff --git a/tests/unit/test_mwcc_context.py b/tests/unit/test_mwcc_context.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_mwcc_context.py
+@@ -0,0 +1,69 @@
++from pathlib import Path
++import tempfile
++import unittest
++
++from m2c.arch_ppc import PpcArch
++from m2c.c_types import build_typemap, parse_c, remove_mwcc_section_attributes, to_c
++from m2c.error import DecompFailure
++
++
++class TestMwccContext(unittest.TestCase):
++    def test_section_placement_does_not_change_real_types(self):
++        context = '''
++struct Entry { char tag; int value; };
++__declspec(section ".init") void *copy(void *dst, const void *src, unsigned int count);
++extern __declspec(section ".sdata2") const struct Entry entries[3];
++'''
++        with tempfile.TemporaryDirectory() as name:
++            path = Path(name) / "context.c"
++            path.write_text(context)
++            types = build_typemap([path], PpcArch(), False)
++        self.assertEqual(to_c(types.functions["copy"].ret_type), "void *")
++        self.assertEqual([to_c(param.type) for param in types.functions["copy"].params],
++                         ["void *", "const void *", "unsigned int"])
++        self.assertEqual(to_c(types.var_types["entries"]), "const struct Entry [3]")
++        self.assertEqual(types.structs["Entry"].size, 8)
++        self.assertEqual(types.structs["Entry"].align, 4)
++
++    def test_only_complete_section_attributes_are_ignored(self):
++        for attribute in ("__declspec(align(16))", "__declspec(noreturn)",
++                          '__declspec(section ".data", align(16))',
++                          '__declspec(section ".data"', '__declspec(section 123)'):
++            with self.subTest(attribute=attribute):
++                source = attribute + " int value;"
++                self.assertEqual(remove_mwcc_section_attributes(source), source)
++                with self.assertRaises(DecompFailure):
++                    parse_c(source, None)
++
++    def test_strings_identifiers_and_character_literals_are_not_attributes(self):
++        source = r'''const char *s = "__declspec(section \".init\")";
++int __declspec_suffix; int value = '(';'''
++        self.assertEqual(remove_mwcc_section_attributes(source), source)
++        parse_c(source, None)
++
++    def test_multiline_and_escaped_section_names_preserve_coordinates(self):
++        source = '__declspec\n( section "a)\\\"b" )\nint value;'
++        cleaned = remove_mwcc_section_attributes(source)
++        self.assertEqual(len(source), len(cleaned))
++        self.assertEqual([index for index, char in enumerate(source) if char == "\n"],
++                         [index for index, char in enumerate(cleaned) if char == "\n"])
++        self.assertEqual(cleaned.index("int value"), source.index("int value"))
++        parse_c(source, None)
++
++    def test_multiple_sections_keep_qualifiers_and_unknown_attributes(self):
++        source = '__declspec(section ".data") const int x;\n__declspec(section ".bss") volatile int y;'
++        ast, _ = parse_c(source, None)
++        self.assertEqual([to_c(node) for node in ast.ext], ["const int x", "volatile int y"])
++        mixed = '__declspec(section ".data") __declspec(align(16)) int x;'
++        self.assertIn("__declspec(align(16))", remove_mwcc_section_attributes(mixed))
++        with self.assertRaises(DecompFailure):
++            parse_c(mixed, None)
++
++    def test_parser_diagnostics_retain_original_line_and_column(self):
++        with self.assertRaises(DecompFailure) as caught:
++            parse_c('typedef int T;\n__declspec(section ".data") int value = ;', None)
++        self.assertIn("line 1, column 41", str(caught.exception))
++
++
++if __name__ == "__main__":
++    unittest.main()

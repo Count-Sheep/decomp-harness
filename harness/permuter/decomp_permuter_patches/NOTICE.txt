@@ -1,0 +1,13 @@
+These patches modify decomp-permuter: https://github.com/simonlindholm/decomp-permuter
+Base revision: 8556c81 (Add a pass to reverse if/else blocks (#215))
+
+decomp-permuter is MIT-licensed (Copyright (c) 2019 Simon Lindholm and
+contributors); these patches are distributed under the same license.
+
+Changes made for decomp-harness:
+- compile_cmd.json next to a work unit's compile.sh may give the compiler argv
+  directly ({"argv": [...]}); the permuter appends "-c SOURCE -o OUTPUT" and
+  runs it without a shell. bash is then not required. Units that mark
+  compile_cmd.json "supported": false keep using compile.sh.
+- When no `cpp` is on PATH, base.c is read verbatim (correct for the harness's
+  already-preprocessed work units) instead of failing.

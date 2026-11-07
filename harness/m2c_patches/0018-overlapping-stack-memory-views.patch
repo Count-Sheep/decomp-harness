@@ -1,0 +1,289 @@
+diff --git a/m2c/arch_ppc.py b/m2c/arch_ppc.py
+index 5df29c9..b7f9dca 100644
+--- a/m2c/arch_ppc.py
++++ b/m2c/arch_ppc.py
+@@ -100,6 +100,17 @@ from .flow_graph import ArchFlowGraph, FlowGraph, InstrRef, RefSet
+ from .types import FunctionSignature, Type
+ 
+ 
++def store_quantized(args: InstrArgs) -> None:
++    target = args.memory_ref(1)
++    source = args.regs.get_raw(args.reg_ref(0))
++    if (isinstance(target, AddressMode)
++            and args.stack_info.is_stack_reg(target.base)
++            and args.stack_info.in_callee_save_reg_region(target.offset)
++            and source is not None and args.stack_info.should_save(source, target.offset)):
++        return None
++    raise DecompFailure("psq_st requires quantization state; refusing to discard the store")
++
++
+ def cr_logical(mnemonic: str, left: Expression, right: Expression) -> Expression:
+     def negate(value: Expression) -> Expression:
+         return UnaryOp("!", value, type=Type.boolean())
+@@ -1716,6 +1727,7 @@ class PpcArch(Arch):
+             is_noreturn=is_noreturn,
+             is_load=is_load,
+             is_store=is_store,
++            memory_size=size if is_load or is_store else None,
+             eval_fn=eval_fn,
+         )
+ 
+@@ -1779,7 +1791,7 @@ class PpcArch(Arch):
+         "stfd": lambda a: make_store(a, type=Type.f64()),
+         "stfsx": lambda a: make_storex(a, type=Type.f32()),
+         "stfdx": lambda a: make_storex(a, type=Type.f64()),
+-        "psq_st": lambda a: None,
++        "psq_st": lambda a: store_quantized(a),
+     }
+     instrs_store_update: StoreInstrMap = {
+         "stbu": lambda a: make_store(a, type=Type.int_of_size(8)),
+diff --git a/m2c/evaluate.py b/m2c/evaluate.py
+index f9bc3e8..19ea4a3 100644
+--- a/m2c/evaluate.py
++++ b/m2c/evaluate.py
+@@ -85,7 +85,7 @@ def deref(
+     elif isinstance(arg, AddressMode):
+         offset = arg.offset
+         if stack_info.is_stack_reg(arg.base):
+-            return stack_info.get_stack_var(offset, store=store)
++            return stack_info.get_stack_var(offset, store=store, size=size, memory_type=memory_type)
+         var = regs[arg.base]
+     else:
+         offset = arg.offset
+diff --git a/m2c/instruction.py b/m2c/instruction.py
+index 22eb449..773878f 100644
+--- a/m2c/instruction.py
++++ b/m2c/instruction.py
+@@ -129,6 +129,7 @@ class Instruction:
+     is_return: bool = False
+     is_load: bool = False
+     is_store: bool = False
++    memory_size: Optional[int] = None
+     is_effectful: bool = True  # only set for ARM at the moment
+ 
+     # These are for MIPS. `is_branch_likely` refers to branch instructions which
+diff --git a/m2c/translate.py b/m2c/translate.py
+index 5b76e17..57c1bd9 100644
+--- a/m2c/translate.py
++++ b/m2c/translate.py
+@@ -324,6 +324,8 @@ class StackInfo:
+     replace_first_arg: Optional[Tuple[str, Type]] = None
+     weak_stack_var_types: Dict[int, Type] = field(default_factory=dict)
+     weak_stack_var_locations: Set[int] = field(default_factory=set)
++    stack_memory_views: List[Tuple[int, int, str]] = field(default_factory=list)
++    stack_memory_backings: Dict[int, LocalVar] = field(default_factory=dict)
+ 
+     def temp_var(self, prefix: str) -> str:
+         counter = self.temp_name_counter.get(prefix, 0) + 1
+@@ -468,7 +470,42 @@ class StackInfo:
+             return True
+         return False
+ 
+-    def get_stack_var(self, location: int, *, store: bool) -> Expression:
++    def get_stack_var(self, location: int, *, store: bool, size: Optional[int] = None,
++                      memory_type: Optional[Type] = None) -> Expression:
++        for start, end, tag in self.stack_memory_views:
++            if start <= location < end:
++                if size is None:
++                    view_type = Type.u8()
++                    size = 1
++                else:
++                    view_type = memory_type or Type.int_of_size(size * 8)
++                if location + size > end or (location - start) % size:
++                    raise DecompFailure("Unaligned or unbounded overlapping stack access")
++                backing = self.stack_memory_backings.get(start)
++                if backing is None:
++                    width = end - start
++                    view = self.global_info.typepool.get_or_create_struct_by_tag_name(tag, None, size=width)
++                    view.is_union = True
++                    view.align = width
++                    if not view.fields:
++                        for bits in (8, 16, 32, 64):
++                            if bits // 8 > width:
++                                continue
++                            for sign in ("u", "s"):
++                                element = Type.int_of_size(bits)
++                                element.unify(Type.uintish() if sign == "u" else Type.sintish())
++                                view.fields.append(StructDeclaration.StructField(
++                                    Type.array(element, width // (bits // 8)), 0, f"{sign}{bits}", False))
++                        for bits in (32, 64):
++                            if bits // 8 <= width:
++                                element = Type.f32() if bits == 32 else Type.f64()
++                                view.fields.append(StructDeclaration.StructField(
++                                    Type.array(element, width // (bits // 8)), 0, f"f{bits}", False))
++                    backing = LocalVar(start, Type.struct(view), [0, f"sp{start:X}"])
++                    self.stack_memory_backings[start] = backing
++                self.add_local_var(backing)
++                prefix = "f" if view_type.is_float() else "s" if view_type.is_signed() else "u"
++                return StackMemoryAccess(backing, location - start, size, prefix, view_type)
+         # See `get_stack_info` for explanation
+         if self.in_callee_save_reg_region(location):
+             # Some annoying bookkeeping instruction. To avoid
+@@ -872,6 +909,37 @@ def get_stack_info(
+     # This acts as the type of the $sp register
+     info.stack_pointer_type = Type.ptr(Type.struct(stack_struct))
+ 
++    # Precompute overlapping PPC accesses so a narrow first store cannot choose
++    # an undersized local before a later wider read is translated.
++    accesses: Set[Tuple[int, int]] = set()
++    for instr in function.body:
++        if not isinstance(instr, Instruction) or instr.in_pattern or not instr.memory_size:
++            continue
++        for arg in instr.args:
++            if not (isinstance(arg, AsmAddressMode) and info.is_stack_reg(arg.base)
++                    and isinstance(arg.addend, AsmLiteral)):
++                continue
++            start, end = arg.addend.value, arg.addend.value + instr.memory_size
++            if (0 <= start < end <= info.allocated_stack_size
++                    and not any(info.in_callee_save_reg_region(offset) for offset in range(start, end))
++                    and not info.in_subroutine_arg_region(start)):
++                accesses.add((start, end))
++    groups: List[List[Tuple[int, int]]] = []
++    for access in sorted(accesses):
++        if groups and access[0] < max(end for _, end in groups[-1]):
++            groups[-1].append(access)
++        else:
++            groups.append([access])
++    for group in groups:
++        if len(group) < 2:
++            continue
++        start, end = min(a for a, _ in group), max(b for _, b in group)
++        width = end - start
++        if width not in (2, 4, 8) or (start, end) not in group:
++            raise DecompFailure("Overlapping stack accesses need a bounded backing scalar")
++        tag = f"{stack_struct_name}_view_{start:X}"
++        info.stack_memory_views.append((start, end, tag))
++
+     return info
+ 
+ 
+@@ -1521,6 +1589,21 @@ class LocalVar(Expression):
+         return self.type.to_decl(self.path[1], fmt)
+ 
+ 
++@dataclass(frozen=True, eq=True)
++class StackMemoryAccess(Expression):
++    backing: LocalVar
++    offset: int
++    size: int
++    prefix: str
++    type: Type = field(compare=False)
++
++    def dependencies(self) -> List[Expression]:
++        return [self.backing]
++
++    def format(self, fmt: Formatter) -> str:
++        return f"{self.backing.format(fmt)}.{self.prefix}{self.size * 8}[{self.offset // self.size}]"
++
++
+ @dataclass(frozen=True, eq=False)
+ class PlannedPhiExpr(Expression):
+     var: Var
+@@ -3689,7 +3772,7 @@ class NodeState:
+ 
+     def prevent_later_reads(self) -> None:
+         """Prevent later uses of registers that recursively contain a read."""
+-        self._prevent_later_uses(lambda e: isinstance(e, (StructAccess, ArrayAccess)))
++        self._prevent_later_uses(lambda e: isinstance(e, (StructAccess, ArrayAccess, StackMemoryAccess)))
+ 
+     def set_initial_reg(self, reg: Register, expr: Expression, meta: RegMeta) -> None:
+         assert meta.initial
+@@ -3812,6 +3895,8 @@ class NodeState:
+     def store_memory(self, store: StoreStmt, reg: Register) -> None:
+         source = store.source
+         dest = store.dest
++        if isinstance(dest, StackMemoryAccess):
++            self._prevent_later_uses(lambda e: isinstance(e, StackMemoryAccess) and e.backing == dest.backing)
+         if isinstance(dest, SubroutineArg):
+             # About to call a subroutine with this argument. Skip arguments for the
+             # first four stack slots; they are also passed in registers.
+diff --git a/tests/unit/test_stack_memory_views.py b/tests/unit/test_stack_memory_views.py
+new file mode 100644
+index 0000000..ec77f22
+--- /dev/null
++++ b/tests/unit/test_stack_memory_views.py
+@@ -0,0 +1,84 @@
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++from m2c.main import parse_flags
++from run_tests import decompile_and_capture_output
++
++
++class TestStackMemoryViews(unittest.TestCase):
++    def translate(self, instructions, context="unsigned int test(unsigned int value);"):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            target = root / "target.s"
++            target.write_text(".fn test, global\nstwu r1,-16(r1)\n" + instructions
++                              + "\naddi r1,r1,16\nblr\n.endfn test\n")
++            header = root / "context.c"
++            header.write_text(context)
++            return decompile_and_capture_output(parse_flags([
++                "-t", "ppc-mwcc-c", "--valid-syntax", "--no-cache",
++                "--explicit-field-access", "--context", str(header), str(target)]))
++
++    def test_byte_reads_share_word_backing_at_each_offset(self):
++        for offset in range(4):
++            with self.subTest(offset=offset):
++                output = self.translate(f"stw r3,8(r1)\nlbz r3,{8 + offset}(r1)")
++                self.assertIn("sp8.u32[0] = value;", output)
++                self.assertIn(f"return (u32) sp8.u8[{offset}];", output)
++                self.assertNotIn("unksp", output)
++
++    def test_halfword_read_preserves_signedness(self):
++        for opcode, prefix in (("lha", "s"), ("lhz", "u")):
++            output = self.translate(f"stw r3,8(r1)\n{opcode} r3,10(r1)")
++            self.assertIn(f"sp8.{prefix}16[1]", output)
++
++    def test_narrow_store_before_wide_read_has_full_backing(self):
++        output = self.translate("sth r3,8(r1)\nsth r3,10(r1)\nlwz r3,8(r1)")
++        self.assertIn("u32 u32[1]", output)
++        self.assertIn("sp8.u16[1]", output)
++        self.assertIn("return sp8.u32[0];", output)
++
++    def test_partial_write_does_not_forward_old_word(self):
++        output = self.translate("stw r3,8(r1)\nli r4,0\nstb r4,9(r1)\nlwz r3,8(r1)")
++        self.assertIn("sp8.u8[1] = 0;", output)
++        self.assertIn("return sp8.u32[0];", output)
++        self.assertNotIn("return value;", output)
++
++    def test_nonoverlapping_locals_do_not_need_union(self):
++        output = self.translate("stw r3,8(r1)\nstw r3,12(r1)\nlwz r3,8(r1)")
++        self.assertNotIn("union", output)
++
++    def test_quantized_store_is_not_silently_discarded(self):
++        output = self.translate("psq_st f1,8(r1),1,qr3\nlhz r3,8(r1)",
++                                "unsigned short test(float value);")
++        self.assertIn("psq_st requires quantization state", output)
++        self.assertNotIn("return sp8", output)
++
++    @unittest.skipUnless(shutil.which("clang"), "Clang required for big-endian codegen")
++    def test_big_endian_byte_selection_is_not_numeric_truncation(self):
++        targets = subprocess.run([shutil.which("clang"), "--print-targets"],
++                                 capture_output=True, text=True, timeout=30)
++        if "armeb" not in targets.stdout:
++            self.skipTest("No ARM big-endian compiler backend")
++        for offset, expected in enumerate((17, 34, 51, 68)):
++            output = self.translate(f"stw r3,8(r1)\nlbz r3,{8 + offset}(r1)")
++            with self.subTest(offset=offset), tempfile.TemporaryDirectory() as directory:
++                source = Path(directory) / "probe.c"
++                source.write_text("typedef unsigned char u8; typedef signed char s8;\n"
++                                  "typedef unsigned short u16; typedef short s16;\n"
++                                  "typedef unsigned int u32; typedef int s32; typedef float f32;\n"
++                                  + output + "\nunsigned int probe(void) { return test(0x11223344U); }\n")
++                result = subprocess.run([shutil.which("clang"), "-target", "armeb-unknown-linux-gnueabi",
++                                         "-ffreestanding", "-std=c89", "-O2", "-S", str(source), "-o", "-"],
++                                        capture_output=True, text=True, timeout=30)
++                self.assertEqual(result.returncode, 0, result.stderr)
++                probe = result.stdout.split("probe:", 1)[1].split(".Lfunc_end", 1)[0]
++                self.assertRegex(probe, rf"mov\s+r0, #{expected}\b")
++
++    def test_read_before_overlapping_write_is_materialized(self):
++        output = self.translate("stw r3,8(r1)\nlbz r4,9(r1)\nli r5,0\n"
++                                "stb r5,9(r1)\nlwz r3,8(r1)\nadd r3,r3,r4")
++        self.assertRegex(output, r"temp_\w+ = sp8.u8\[1\];")
++        self.assertLess(output.index("= sp8.u8[1];"), output.index("sp8.u8[1] = 0;"))

@@ -1,0 +1,28 @@
+{
+  "_about": "Copy to harness.local.json (untracked) or point DECOMP_HARNESS_CONFIG at a copy. Relative paths resolve against this file's directory.",
+  "default_project": "example",
+  "projects": [
+    {
+      "id": "example",
+      "name": "Example decomp",
+      "root": "../example-decomp",
+      "version": "EXAMPLE01",
+      "references": []
+    }
+  ],
+  "tools": {
+    "m2c": "build/tools/m2c"
+  },
+  "reference_corpora": [],
+  "permuter": {
+    "farm_root": null,
+    "results_dir": null
+  },
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "cache_seconds": 2,
+    "permuter_status": null,
+    "m2c_executors": []
+  }
+}

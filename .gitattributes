@@ -1,0 +1,10 @@
+# Keep every text file LF on all platforms; m2c patches must apply byte-exact.
+* text=auto eol=lf
+*.patch text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.png binary
+*.o binary
+*.elf binary
+*.dol binary
