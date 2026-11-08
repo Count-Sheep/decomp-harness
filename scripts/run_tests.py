@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -23,11 +24,22 @@ def run(command: list[str], cwd: Path) -> bool:
     print(f"\n$ {' '.join(command)}  (in {cwd.relative_to(REPO) if cwd != REPO else '.'})", flush=True)
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     # Tests never read a developer's real configuration.
-    env.pop("DECOMP_HARNESS_CONFIG", None)
-    for name in ("DECOMP_PROJECT", "DECOMP_ROOT", "DECOMP_VERSION"):
+    for name in ("DECOMP_HARNESS_CONFIG", "DECOMP_PROJECT", "DECOMP_ROOT", "DECOMP_VERSION"):
         env.pop(name, None)
     env["DECOMP_HARNESS_CONFIG"] = str(REPO / "harness.example.json")
-    return subprocess.run(command, cwd=cwd, env=env).returncode == 0
+    # The selected project is an empty temporary directory: a test that writes into the
+    # configured project instead of its own temporary directory fails the run.
+    with tempfile.TemporaryDirectory(prefix="decomp-harness-sentinel-") as sentinel:
+        env["DECOMP_ROOT"] = sentinel
+        env["DECOMP_VERSION"] = "EXAMPLE01"
+        ok = subprocess.run(command, cwd=cwd, env=env).returncode == 0
+        leaked = sorted(str(path.relative_to(sentinel)) for path in Path(sentinel).rglob("*") if path.is_file())
+    if leaked:
+        print("tests wrote into the configured project root (they must use temporary directories):")
+        for path in leaked[:20]:
+            print(f"  {path}")
+        return False
+    return ok
 
 
 def harness() -> bool:

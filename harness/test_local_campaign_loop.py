@@ -12,6 +12,34 @@ import local_campaign as campaign
 from local_campaign_coordination import Coordinator
 
 
+_ISOLATION = None
+
+
+def setUpModule():
+    """Keep every module-level campaign path inside a temporary directory.
+
+    ``local_campaign`` derives ``STATE_DIR``, its coordinator lock and other files from the configured
+    project root at import time. Tests patch what they use, but anything they miss must never land
+    in a real checkout.
+    """
+    global _ISOLATION
+    temporary = tempfile.TemporaryDirectory()
+    root = Path(temporary.name)
+    state = root / "build" / "local_llm_campaign"
+    state.mkdir(parents=True)
+    patcher = patch.multiple(campaign, ROOT=root, STATE_DIR=state, STATE_FILE=state / "state.json",
+                             REPORT_FILE=root / "build" / "TEST01" / "report.json",
+                             PRIORITY_FILE=state / "priority.json", COORDINATOR=Coordinator(state))
+    patcher.start()
+    _ISOLATION = (temporary, patcher)
+
+
+def tearDownModule():
+    temporary, patcher = _ISOLATION
+    patcher.stop()
+    temporary.cleanup()
+
+
 class LoopTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
