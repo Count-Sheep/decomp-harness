@@ -56,13 +56,17 @@ def fingerprint(root: Path, version: str, batch: Path, rows: list[dict]) -> str:
 
 
 def validate_one(root: Path, version: str, row: dict, folder: Path, environment: str,
-                 linked: set[str], current_index: m2c_current_source.Index | None = None) -> dict:
+                 linked: set[str], current_index: m2c_current_source.Index | None = None,
+                 holdout: bool = False) -> dict:
+    """Score one draft. ``holdout`` batches benchmark already matched functions: they are scored
+    even though they are source-backed, and the project's own source (the answer) is not a
+    candidate."""
     record = {key: row.get(key) for key in ("id", "symbol", "unit")}
     scope = ("standalone_inferred_profile" if (row.get("compiler_profile") or {}).get("selected")
              else "standalone_fallback_flags")
     record.update(draft_status=row.get("status"), scope=scope,
                   review_eligible=False, promoted=False, tested_at=datetime.now(UTC).isoformat())
-    if row.get("symbol") in linked:
+    if not holdout and row.get("symbol") in linked:
         return {**record, "status": "linked_elsewhere", "linked": True, "compile_ok": False,
                 "instruction_exact": False, "pct": None, "profile": None, "diff": "",
                 "error": "Function is now source-backed; historical draft scoring skipped"}
@@ -104,7 +108,7 @@ def validate_one(root: Path, version: str, row: dict, folder: Path, environment:
     outcomes = []
     candidate_sources = {}
     try:
-        current = m2c_current_source.measure(root, version, row, current_index)
+        current = None if holdout else m2c_current_source.measure(root, version, row, current_index)
         if current is not None:
             outcomes.append(("current_source", current))
             candidate_sources["current_source"] = current["candidate"]
@@ -219,6 +223,9 @@ def run(root: Path, version: str, batch: Path, force: bool = False,
     if not (data.get("summary") or {}).get("finished"):
         raise ValueError("m2c batch is not complete")
     rows = sorted(data["results"], key=lambda row: (row["unit"], row["address"]))
+    holdout = (data.get("summary") or {}).get("selection") == "holdout"
+    if holdout:
+        refinement_limit, auto_promote = 0, False  # a benchmark never refines or promotes
     environment = fingerprint(root, version, batch, rows)
     support = root / "build/decomp-support" / version
     linked = linked_symbols(root, version)
@@ -268,7 +275,8 @@ def run(root: Path, version: str, batch: Path, force: bool = False,
         print(f"{summary['processed']}/{summary['total']} {row['symbol']}: {result['status']} (reused)", flush=True)
 
     def validate(index: int, row: dict, item: Path) -> tuple[int, dict, dict]:
-        result = validate_one(root, version, row, item, environment, linked, current_index)
+        result = (validate_one(root, version, row, item, environment, linked, current_index, holdout=True)
+                  if holdout else validate_one(root, version, row, item, environment, linked, current_index))
         attempts.write_json(item / "result.json", result)
         compact_validation_item(item)
         return index, row, result

@@ -211,31 +211,53 @@ uses two kinds of evidence.
   upstream marks as matching, with the compiler version upstream uses, then
   indexes the resulting assembly next to its C.
 
-How the evidence improves results:
+Where the evidence is used:
 
-1. **Exact reuse.** If a target function's bytes are identical to an already
-   matched function elsewhere (common for SDK and runtime code), the draft
-   starts from that known-good C instead of a guess, and gains priority.
-2. **Similar matched examples.** Every target is scored against the reference
-   pool by opcode mix, size, control flow, calls and stack frame. The closest
-   matched functions, with their real C, go into the draft's context and the
-   model prompts. Seeing how a structurally similar function was written is the
-   main way the context turns into code that matches.
-3. **Types and declarations.** Matched references bring real prototypes,
-   struct layouts and extern declarations. m2c's typed context then emits
-   fewer `?`/`M2C_ERROR` placeholders and compiles more often.
-4. **Compiler profile.** References carry the MWCC version and flags they
-   matched with, which helps choose settings for units that share a library.
-5. **Templates and library lookups.** The template index and the draft
-   campaign's library-reference lookup search the same pool by normalized
-   instruction shape and by symbol name.
+1. **Reference examples for model-backed drafting.** Every target is scored
+   against the reference pool by opcode mix, size, control flow, calls and stack
+   frame. The closest matched functions, with their real C, are attached to each
+   draft and passed to the models in `m2c_draft_attempts.py` and the local-LLM
+   campaign. This is where similar code helps most: a model that sees how a
+   structurally similar function was written produces matching C more often.
+2. **Code-verified reference candidates.** When a reference's compiled bytes
+   match the target, validation scores that reference's C as a candidate
+   alongside m2c's output.
+3. **Exact reuse.** When an exact-function inventory
+   (`build/decomp-support/cross-project-exact.json`) lists a byte-identical
+   function in another project, the draft is marked for reuse instead of
+   decompiled, and it gains priority.
+4. **Prioritization and templates.** Reference similarity raises a function's
+   draft priority. The template index and the campaign's library-reference
+   lookup search the same pool by instruction shape and symbol name.
 
-More evidence helps most when it shares the target's SDK version, compiler
-version or engine. Corpora from unrelated codebases mostly add noise. A run
-records how much evidence it used: the m2c report lists `reference_pool`,
+Evidence does **not** change the C that m2c itself emits. m2c works from the
+target's assembly and the project's own headers. A holdout benchmark (below)
+with a 64,000-function corpus produced byte-identical m2c drafts with and
+without the corpus. So measure corpora with the model-backed stages, not with
+raw m2c drafts.
+
+Evidence helps most when it shares the target's SDK version, compiler version
+or engine. A run records what it used: the m2c report lists `reference_pool`,
 `reference_projects` and `reference_examples`, and the dashboard shows them.
 
-Example corpus entries (the format is documented in
+Most public GameCube and Wii decomps use the dtk template, and for those one line
+per repository is enough. `"kind": "dtk"` runs the corpus's own `configure.py`
+with its build step intercepted, so no disc image is needed, and compiles every
+`Matching` object with the MWCC version, flags and Shift-JIS setting that project
+uses. Sources that need disc-generated headers just fail and are reported.
+Repositories that fail to clone or configure are skipped.
+
+```json
+"reference_corpora": [
+  {"name": "sibling-a", "url": "https://github.com/OWNER/sibling-a-decomp.git", "license": "see upstream",
+   "role": "same engine as the target", "jobs": {"kind": "dtk"}},
+  {"name": "sibling-b", "url": "https://github.com/OWNER/sibling-b-decomp.git", "license": "see upstream",
+   "role": "SDK and runtime of the same era", "jobs": {"kind": "dtk"}}
+]
+```
+
+Repositories that aren't dtk-template projects use `"kind": "sources"` with an
+explicit compiler and flags (the format is documented in
 [`harness/reference_corpus.py`](harness/reference_corpus.py)):
 
 ```json
@@ -256,8 +278,21 @@ Example corpus entries (the format is documented in
 ]
 ```
 
-`"kind": "configure"` instead reads a dtk-template project's `configure.py` and
-takes its `Object(Matching, ...)` entries for the library functions you name.
+`"kind": "ninja"` reads an already built dtk-template project's `build.ninja` and
+`objdiff.json`. `"kind": "configure"` statically parses the `Object(Matching, ...)`
+entries of the library functions you name.
+
+To measure what your evidence actually buys, draft a seeded sample of functions
+the project has already matched. The project's own code is never used as
+evidence, so the scores show what drafting would have achieved before those
+functions were matched:
+
+```sh
+python harness/m2c_drafts.py --holdout 300 --seed 1 --min-bytes 4 --max-bytes 65536 --context-declarations --readonly-data
+python harness/m2c_validate_drafts.py --batch <printed folder> --refinement-limit 0 --keep-superseded
+```
+
+Run it with different `reference_corpora` and compare the results.
 Corpus checkouts and indexes go in this repository's ignored `build/`, and
 compilers come from `tools.reference_toolchain` (any built dtk-template checkout;
 default: the selected project).

@@ -196,6 +196,22 @@ class AssemblyFeatureTests(unittest.TestCase):
         references = context.find_similar_references(target, projects, 3, index=index)
         self.assertEqual([row["symbol"] for row in references].count("SharedSdk"), 1)
 
+    def test_reference_retrieval_prefers_the_closest_projects_over_alphabetical_order(self):
+        target = context.parse_assembly_features(ASM, "target_fn")
+        distant = dict(target, instruction_count=999, opcodes={"nop": 999}, calls=[], stack_frame=0)
+        names = ["a1", "a2", "a3", "a4", "a5", "z1", "z2"]
+        projects = tuple(context.ProjectSpec(name, Path(name), "v") for name in names)
+        index = {"functions": [
+            {"project": name, "symbol": f"fn_{name}", "address": 1, "size": 40, "unit": "u",
+             "source_path": "u.c", "compiler": None,
+             "features": target if name.startswith("z") else distant}
+            for name in names]}
+        with patch.object(context, "_enrich_reference",
+                          side_effect=lambda row, project, score, chars: {**row, "similarity": score}):
+            references = context.find_similar_references(target, projects, 5, index=index)
+        self.assertEqual([row["project"] for row in references[:2]], ["z1", "z2"])
+        self.assertEqual(len(references), 5)
+
     def test_report_address_falls_back_to_generated_symbol_suffix(self):
         self.assertEqual(
             context._function_address({}, {"name": "fn_80001234", "address": "0"}),

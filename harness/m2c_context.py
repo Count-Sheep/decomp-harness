@@ -790,11 +790,14 @@ def find_similar_references(
     scored.sort(key=lambda item: (-item[0], item[1]["project"], item[1]["symbol"],
                                   item[1]["address"] or -1))
 
-    selected: list[tuple[float, Mapping[str, Any]]] = []
-    for project in sorted({row["project"] for _, row in scored}):
-        candidate = next((item for item in scored if item[1]["project"] == project), None)
-        if candidate:
-            selected.append(candidate)
+    # One best match per project keeps references diverse, but rank those by score: with more
+    # projects than ``limit`` the closest projects win, not the alphabetically first ones.
+    best_per_project: dict[str, tuple[float, Mapping[str, Any]]] = {}
+    for candidate in scored:
+        best_per_project.setdefault(candidate[1]["project"], candidate)
+    selected: list[tuple[float, Mapping[str, Any]]] = sorted(
+        best_per_project.values(), key=lambda item: (-item[0], item[1]["project"], item[1]["symbol"])
+    )[:limit]
     for candidate in scored:
         if len(selected) >= limit:
             break

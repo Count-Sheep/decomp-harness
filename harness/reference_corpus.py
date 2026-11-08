@@ -24,6 +24,16 @@ Each entry describes one source repository::
       }
     }
 
+``"kind": "dtk"`` is the simplest for dtk-template projects and needs no disc image: the
+corpus's own ``configure.py`` is evaluated with its build generation captured
+(``dtk_configure_probe.py``), and every ``Matching`` object is compiled with the MWCC version,
+``cflags`` and Shift-JIS setting dtk-template resolves for it (``configure_args`` optional).
+
+``"kind": "ninja"`` reads an already built dtk-template project instead: ``sync`` runs the corpus's own
+``configure.py`` (``configure_args`` optional; no disc image needed) and every unit its
+``objdiff.json`` marks complete is compiled with that unit's exact MWCC version and flags from
+``build.ninja``. An optional ``include`` regex limits source paths.
+
 ``"kind": "configure"`` instead reads a dtk-template ``configure.py`` without executing it and
 takes every literal ``Object(Matching, "path")`` inside calls to the functions named by
 ``libraries`` (``{"FunctionName": "GC/1.2.5n", ...}``, the compiler for that call). ``source``
@@ -111,28 +121,42 @@ def repositories(configured: Any = None) -> list[dict[str, Any]]:
 
 
 def sync(refresh: bool = False, items: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """Clone small source-only checkouts and optionally fast-forward them."""
+    """Clone small source-only checkouts and optionally fast-forward them.
+
+    A corpus that cannot be cloned or configured is reported with ``status: "unavailable"`` and
+    skipped, so one bad entry does not stop the others.
+    """
     items = repositories() if items is None else items
     REFERENCE_ROOT.mkdir(parents=True, exist_ok=True)
     rows = []
     for item in items:
         root = REFERENCE_ROOT / item["name"]
-        if not (root / ".git").is_dir():
-            result = command(
-                ["git", "clone", "--depth", "1", "--filter=blob:none", item["url"], str(root)],
-                REFERENCE_ROOT,
-                600,
-            )
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or f"failed to clone {item['name']}")
-        elif refresh:
-            result = command(["git", "pull", "--ff-only"], root, 300)
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or f"failed to update {item['name']}")
-        if item.get("configure") and not (root / "build.ninja").is_file():
-            result = command([python_command(), "configure.py"], root, 120)
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or f"failed to configure {item['name']}")
+        try:
+            if not (root / ".git").is_dir():
+                result = command(
+                    ["git", "clone", "--depth", "1", "--filter=blob:none", item["url"], str(root)],
+                    REFERENCE_ROOT,
+                    1800,
+                )
+                if result.returncode:
+                    raise RuntimeError(result.stderr.strip() or f"failed to clone {item['name']}")
+            elif refresh:
+                result = command(["git", "pull", "--ff-only"], root, 300)
+                if result.returncode:
+                    raise RuntimeError(result.stderr.strip() or f"failed to update {item['name']}")
+            wants_configure = item.get("configure") or (item.get("jobs") or {}).get("kind") == "ninja"
+            if wants_configure and (refresh or not (root / "build.ninja").is_file()):
+                args = [str(arg) for arg in item.get("configure_args") or []]
+                result = command([python_command(), "configure.py", *args], root, 300)
+                if result.returncode:
+                    raise RuntimeError((result.stderr or result.stdout).strip()[-2000:]
+                                       or f"failed to configure {item['name']}")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            last = str(error).strip().splitlines()[-1] if str(error).strip() else repr(error)
+            print(f"{item['name']}: unavailable: {last}", flush=True)
+            rows.append({**item, "root": str(root.resolve()), "status": "unavailable",
+                         "error": str(error)[-2000:]})
+            continue
         rows.append({**item, "root": str(root.resolve()), "revision": revision(root)})
     return rows
 
@@ -231,6 +255,153 @@ def configure_jobs(name: str, root: Path, spec: dict[str, Any]) -> list[dict[str
     return jobs
 
 
+def _ninja_tokens(text: str) -> list[str]:
+    """Split a ninja path list on unescaped spaces and unescape ``$ ``, ``$:`` and ``$$``."""
+    tokens, current, index = [], [], 0
+    while index < len(text):
+        char = text[index]
+        if char == "$" and index + 1 < len(text):
+            current.append(text[index + 1])
+            index += 2
+            continue
+        if char == " ":
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _norm(path: str) -> str:
+    return path.replace("\\", "/").lower()
+
+
+def ninja_compile_edges(path: Path) -> dict[str, dict[str, Any]]:
+    """MWCC compile edges of a dtk-template ``build.ninja``, keyed by normalized object path."""
+    text = re.sub(r"\$\r?\n[ \t]*", "", path.read_text(encoding="utf-8", errors="replace"))
+    edges: dict[str, dict[str, Any]] = {}
+    current: dict[str, Any] | None = None
+    for line in text.splitlines():
+        if line.startswith("build "):
+            current = None
+            head, _, rest = line[len("build "):].partition(": ")
+            outputs = _ninja_tokens(head.split(" | ")[0])
+            parts = rest.split(" || ")[0].split(" | ")[0].split(" ", 1)
+            rule = parts[0]
+            inputs = _ninja_tokens(parts[1]) if len(parts) > 1 else []
+            if "mwcc" in rule and outputs and inputs and \
+                    inputs[0].lower().endswith((".c", ".cpp", ".cp", ".cc")):
+                current = {"rule": rule, "object": outputs[0], "source": inputs[0], "vars": {}}
+                edges[_norm(outputs[0])] = current
+        elif current is not None and line[:1] in (" ", "\t") and "=" in line:
+            key, _, value = line.strip().partition("=")
+            current["vars"][key.strip()] = value.strip()
+        elif line.strip():
+            current = None
+    return edges
+
+
+def _split_flags(value: str) -> list[str]:
+    """POSIX-quoted flags as ninja writes them, keeping Windows backslashes literally."""
+    lexer = shlex.shlex(value, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    return list(lexer)
+
+
+def matching_units(objdiff: Path) -> set[str]:
+    """Normalized base object paths of the units ``objdiff.json`` marks complete."""
+    data = json.loads(objdiff.read_text(encoding="utf-8"))
+    rows = set()
+    for unit in data.get("units") or []:
+        metadata = unit.get("metadata") or {}
+        complete = metadata.get("complete", unit.get("complete"))
+        base = unit.get("base_path")
+        if complete is True and base:
+            rows.add(_norm(base))
+    return rows
+
+
+def ninja_jobs(name: str, root: Path, spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every matching unit of a dtk-template project, with its own MWCC version and flags.
+
+    ``python configure.py`` (run by ``sync``) writes ``build.ninja`` and ``objdiff.json``; no disc
+    image is needed for that. Units objdiff marks ``complete`` are compiled with the exact compiler
+    and ``cflags`` of their ninja edge. Sources that need disc-generated headers fail to compile and
+    are reported, not guessed at. An optional ``include`` regex limits the source paths.
+    """
+    ninja, objdiff = root / "build.ninja", root / "objdiff.json"
+    if not ninja.is_file() or not objdiff.is_file():
+        raise SystemExit(f"Reference corpus {name}: run `python configure.py` first "
+                         "(no build.ninja/objdiff.json)")
+    edges = ninja_compile_edges(ninja)
+    object_dir = root / spec.get("object_dir", f"build/reference-objects/{name}")
+    include = re.compile(spec["include"]) if spec.get("include") else None
+    jobs = []
+    for base in sorted(matching_units(objdiff)):
+        edge = edges.get(base)
+        if not edge:
+            continue
+        source = (root / edge["source"].replace("\\", "/")).resolve()
+        try:
+            relative = source.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if not source.is_file() or (include and not include.search(relative.as_posix())):
+            continue
+        version = edge["vars"].get("mw_version", "").replace("\\", "/")
+        if not version:
+            continue
+        jobs.append({"project": name, "root": root, "source": source,
+                     "object": object_dir / relative.with_suffix(".o"),
+                     "compiler_version": version, "flags": _split_flags(edge["vars"].get("cflags", "")),
+                     "sjis": "sjis" in edge["rule"]})
+    return jobs
+
+
+PROBE = Path(__file__).resolve().with_name("dtk_configure_probe.py")
+
+
+def dtk_jobs(name: str, root: Path, spec: dict[str, Any], configure_args: list[str]) -> list[dict[str, Any]]:
+    """Every ``Matching`` object a dtk-template ``configure.py`` declares, with its own flags.
+
+    Works without the corpus's disc image: ``dtk_configure_probe.py`` runs ``configure.py`` with
+    its build generation captured and reports each complete object's resolved MWCC version,
+    ``cflags`` and Shift-JIS setting. An optional ``include`` regex limits source paths.
+    """
+    result = command([python_command(), str(PROBE), *configure_args], root, 300)
+    if result.returncode:
+        raise SystemExit(f"Reference corpus {name}: configure probe failed: "
+                         f"{(result.stderr or result.stdout).strip()[-1000:]}")
+    include = re.compile(spec["include"]) if spec.get("include") else None
+    object_dir = root / spec.get("object_dir", f"build/reference-objects/{name}")
+    jobs, seen = [], set()
+    for line in result.stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        row = json.loads(line)
+        source = (root / row["source"]).resolve()
+        try:
+            relative = source.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if source in seen or not source.is_file() or (include and not include.search(relative.as_posix())):
+            continue
+        seen.add(source)
+        jobs.append({"project": name, "root": root, "source": source,
+                     "object": object_dir / relative.with_suffix(".o"),
+                     # dtk-template flag entries are command-line fragments ("-cwd source",
+                     # '-pragma "cats off"'): join them and split like the real build does.
+                     "compiler_version": row["mw_version"],
+                     "flags": _split_flags(" ".join(str(flag) for flag in row["cflags"])),
+                     "sjis": bool(row.get("shift_jis"))})
+    return jobs
+
+
 def corpus_jobs(item: dict[str, Any]) -> list[dict[str, Any]]:
     spec = item.get("jobs") or {}
     root = Path(item["root"])
@@ -238,6 +409,10 @@ def corpus_jobs(item: dict[str, Any]) -> list[dict[str, Any]]:
     kind = spec.get("kind", "sources")
     if kind == "configure":
         return configure_jobs(name, root, spec)
+    if kind == "ninja":
+        return ninja_jobs(name, root, spec)
+    if kind == "dtk":
+        return dtk_jobs(name, root, spec, [str(arg) for arg in item.get("configure_args") or []])
     if kind == "sources":
         if not spec.get("compiler"):
             raise SystemExit(f"Reference corpus {name}: \"sources\" jobs need a compiler")
@@ -247,7 +422,12 @@ def corpus_jobs(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 def compile_job(job: dict[str, Any]) -> dict[str, Any]:
     job["object"].parent.mkdir(parents=True, exist_ok=True)
-    args = [*compiler_wrapper(toolchain_root()), str(compiler(job["compiler_version"])), *job["flags"],
+    try:
+        mwcc = str(compiler(job["compiler_version"]))
+        prefix = [str(executable("sjiswrap.exe"))] if job.get("sjis") else []
+    except FileNotFoundError as error:
+        return {**job, "compile_command": [], "compiled": False, "error": f"missing tool: {error}"}
+    args = [*compiler_wrapper(toolchain_root()), *prefix, mwcc, *job["flags"],
             "-c", job["source"].relative_to(job["root"]).as_posix(), "-o",
             job["object"].relative_to(job["root"]).as_posix()]
     result = command(args, job["root"], 120)
@@ -320,12 +500,21 @@ def build(workers: int = 4) -> dict[str, Any]:
     sources = sync(False)
     active, staged = [], []
     for item in sources:
+        if item.get("status") == "unavailable":
+            staged.append(item)
+            continue
         if not item.get("jobs"):
             staged.append({**item, "status": "source_only",
                            "reason": item.get("reason") or "no compile jobs configured"})
             continue
         name = str(item.get("corpus") or item["name"])
-        compiled = compile_jobs(corpus_jobs(item), workers)
+        try:
+            jobs = corpus_jobs(item)
+        except (SystemExit, OSError, ValueError) as error:
+            staged.append({**item, "status": "unavailable", "error": str(error)[-2000:]})
+            continue
+        print(f"{name}: compiling {len(jobs)} matching objects", flush=True)
+        compiled = compile_jobs(jobs, workers)
         active.append(import_corpus(name, compiled, (item.get("jobs") or {}).get("scratch_compilers")))
     registry = {"schema_version": 1, "generated_at": now(), "projects": active,
                 "staged_projects": staged, "source_repositories": sources}

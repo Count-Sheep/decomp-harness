@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,7 +45,8 @@ def symbols(root: Path, version: str) -> dict[str, tuple[int, int]]:
     return result
 
 
-def candidates(root: Path, version: str, minimum: int, maximum: int) -> list[dict]:
+def candidates(root: Path, version: str, minimum: int, maximum: int, *, matched: bool = False) -> list[dict]:
+    """Size-verified functions that are not exact yet, or (``matched``) only the exact ones."""
     known = symbols(root, version)
     config = json.loads((root / "build" / version / "config.json").read_text(encoding="utf-8"))
     active = {
@@ -66,7 +68,7 @@ def candidates(root: Path, version: str, minimum: int, maximum: int) -> list[dic
         for match in FUNCTION.finditer(text):
             symbol = match.group("symbol")
             expected = known.get(symbol)
-            if symbol in exact or expected is None or not minimum <= expected[1] <= maximum:
+            if (symbol in exact) != matched or expected is None or not minimum <= expected[1] <= maximum:
                 continue
             addresses = [int(value, 16) for value in INSTRUCTION.findall(match.group())]
             if not addresses or addresses[0] != expected[0] or len(addresses) * 4 != expected[1]:
@@ -164,7 +166,15 @@ def run(root: Path, version: str, limit: int, jobs: int, timeout: int,
         minimum: int, maximum: int, force: bool = False,
         start: int | None = None, end: int | None = None, replay: Path | None = None,
         *, context_declarations: bool = False, readonly_data: bool = False,
-        executors: list[str] | None = None) -> dict:
+        executors: list[str] | None = None, holdout: int = 0, seed: int = 0) -> dict:
+    """Draft unmatched functions, or with ``holdout`` a seeded sample of already matched ones.
+
+    Holdout batches benchmark the pipeline against functions whose matching C is known. The
+    target's own source is never used as evidence, so the result shows what drafting would have
+    achieved before those functions were matched.
+    """
+    if holdout and replay:
+        raise ValueError("--holdout cannot be combined with --replay")
     if replay and readonly_data:
         raise ValueError("Readonly enrichment requires a fresh batch; legacy replays lack frozen owner data")
     root = root.resolve()
@@ -180,10 +190,16 @@ def run(root: Path, version: str, limit: int, jobs: int, timeout: int,
         replay = replay.resolve()
         rows = replay_rows(root, version, replay)
     else:
-        rows = [row for row in candidates(root, version, minimum, maximum)
+        rows = [row for row in candidates(root, version, minimum, maximum, matched=holdout > 0)
                 if (start is None or row["address"] >= start)
                 and (end is None or row["address"] + row["size"] <= end)]
-        rows = prioritized(rows, limit, catalog)
+        if holdout:
+            rows = sorted(random.Random(seed).sample(rows, min(holdout, len(rows))),
+                          key=lambda row: row["address"])
+            for row in rows:
+                candidate_priority(row, set())
+        else:
+            rows = prioritized(rows, limit, catalog)
     if not rows:
         raise ValueError(f"{version}: no size-verified .text functions found")
     metadata = decompile.tool_metadata()
@@ -202,6 +218,7 @@ def run(root: Path, version: str, limit: int, jobs: int, timeout: int,
                 "reference_index_fingerprint": (catalog.get("reference_index") or {}).get("fingerprint"),
                 "cross_project_generated_at": (catalog.get("cross_project_exact") or {}).get("generated_at"),
                 "baseline": replay.name if replay else "live",
+                "selection": f"holdout:{seed}" if holdout else "unmatched",
                 "address_range": [start, end],
                 "targets": [(row["address"], row["size"], row["assembly_sha256"]) for row in rows]}
     run_id = sha256(json.dumps(identity, sort_keys=True).encode())[:20]
@@ -236,7 +253,7 @@ def run(root: Path, version: str, limit: int, jobs: int, timeout: int,
         if finished and readonly_data and identity["readonly_owners"] != decompile.m2c_readonly_data.owner_fingerprints(
                 root, version, [row["unit"] for row in rows]):
             raise ValueError("Readonly owner inputs changed during generation; batch remains unfinished")
-        summary = {"run_id": run_id, "selection": "unmatched", "pipeline": {"version": PIPELINE_VERSION,
+        summary = {"run_id": run_id, "selection": "holdout" if holdout else "unmatched", "pipeline": {"version": PIPELINE_VERSION,
                    "model_calls": 0, "role": "Typed m2c hypotheses with matched references, exact reuse, and compiler evidence",
                    "reference_pool": len((catalog.get("reference_index") or {}).get("functions") or []),
                    "reference_projects": [row.get("name") for row in catalog.get("reference_projects") or []]},
@@ -323,6 +340,9 @@ def main() -> None:
     parser.add_argument("--start", type=lambda value: int(value, 0), help="inclusive function address")
     parser.add_argument("--end", type=lambda value: int(value, 0), help="exclusive function end address")
     parser.add_argument("--force", action="store_true", help="regenerate this run's existing drafts")
+    parser.add_argument("--holdout", type=int, default=0, metavar="N",
+                        help="benchmark: draft a seeded sample of N already matched functions instead")
+    parser.add_argument("--seed", type=int, default=0, help="sample seed for --holdout")
     parser.add_argument("--context-declarations", action="store_true", help="emit referenced context declarations (requires m2c patch 0015)")
     parser.add_argument("--readonly-data", action="store_true", help="capture referenced readonly bytes from the target owner")
     parser.add_argument("--executor", action="append", default=[], metavar="EXECUTOR=SLOTS",
@@ -339,7 +359,7 @@ def main() -> None:
     summary = run(args.root, args.version, args.limit, args.jobs, args.timeout,
                   args.min_bytes, args.max_bytes, args.force, args.start, args.end, args.replay,
                   context_declarations=args.context_declarations, readonly_data=args.readonly_data,
-                  executors=args.executor or None)
+                  executors=args.executor or None, holdout=args.holdout, seed=args.seed)
     print(json.dumps({key: summary[key] for key in ("run_id", "version", "total", "counts", "folder")}, indent=2))
 
 

@@ -103,6 +103,17 @@ class DraftValidationTests(unittest.TestCase):
             }]}))
             self.assertEqual(validator.linked_symbols(root, "TEST01"), set())
 
+    def test_holdout_scores_source_backed_functions_without_their_own_source(self):
+        row = {"id": "one", "symbol": "fn_matched", "unit": "auto", "status": "decompile_error"}
+        with patch.object(validator.m2c_current_source, "measure") as measure:
+            normal = validator.validate_one(Path("/unused"), "TEST01", row, Path("/unused"), "env",
+                                            {"fn_matched"})
+            held_out = validator.validate_one(Path("/unused"), "TEST01", row, Path("/unused"), "env",
+                                              {"fn_matched"}, holdout=True)
+        self.assertEqual(normal["status"], "linked_elsewhere")
+        self.assertEqual(held_out["status"], "missing_draft")
+        measure.assert_not_called()
+
     def test_cross_project_exact_source_bypasses_m2c_without_claiming_target_linkage(self):
         row = {"id": "one", "symbol": "KnownSDK", "unit": "auto", "status": "exact_reuse",
                "exact_reuse": {"project": "ref", "source": "src/sdk.c"}}

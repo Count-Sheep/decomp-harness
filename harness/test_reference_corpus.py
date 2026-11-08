@@ -10,7 +10,66 @@ FAKE_CORPUS = {"name": "fake-sdk", "url": "https://example.invalid/fake-sdk.git"
                                                 "compiler": "GC/1.0", "flags": "-O4,p -i include"}}
 
 
+FAKE_PROJECT = '''
+class Object:
+    def __init__(self, completed, name, **options):
+        self.completed, self.name = completed, name
+        self.options = {"cflags": None, "extra_cflags": [], "mw_version": None, "shift_jis": None,
+                        "source": name, "src_dir": None}
+        self.options.update(options)
+
+    def resolve(self, config, lib):
+        obj = Object(self.completed, self.name, **lib)
+        for key, value in self.options.items():
+            if value is not None or key not in obj.options:
+                obj.options[key] = value
+        for key, value in (("mw_version", config.linker_version), ("shift_jis", True), ("src_dir", "src")):
+            if obj.options.get(key) is None:
+                obj.options[key] = value
+        from pathlib import Path
+        obj.src_path = Path(obj.options["src_dir"]) / obj.options["source"]
+        return obj
+
+
+def generate_build(config):
+    raise SystemExit("the probe must capture generate_build")
+'''
+
+FAKE_CONFIGURE = '''
+from types import SimpleNamespace
+from tools.project import Object, generate_build
+config = SimpleNamespace(linker_version="GC/1.3", libs=[
+    {"lib": "sdk", "mw_version": "GC/1.2.5", "cflags": ["-O4,p", '-pragma "cats off"', "-cwd source"],
+     "objects": [Object(True, "sdk/os.c", extra_cflags=["-DX=1"]), Object(False, "sdk/skip.c")]},
+    {"lib": "game", "cflags": ["-O2"], "objects": [Object(True, "game/main.c", shift_jis=False),
+                                                     Object(True, "game/missing.c")]},
+])
+generate_build(config)
+'''
+
+
 class ReferenceCorpusTests(unittest.TestCase):
+    def test_dtk_jobs_read_matching_objects_without_a_disc(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tools").mkdir()
+            (root / "tools/__init__.py").write_text("", encoding="utf-8")
+            (root / "tools/project.py").write_text(FAKE_PROJECT, encoding="utf-8")
+            (root / "configure.py").write_text(FAKE_CONFIGURE, encoding="utf-8")
+            for name in ("sdk/os.c", "sdk/skip.c", "game/main.c"):
+                (root / "src" / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / "src" / name).write_text("int f(void) { return 0; }\n", encoding="utf-8")
+            jobs = corpus.dtk_jobs("fake", root, {}, [])
+        rows = {job["source"].relative_to(root.resolve()).as_posix(): job for job in jobs}
+        self.assertEqual(sorted(rows), ["src/game/main.c", "src/sdk/os.c"])
+        self.assertEqual(rows["src/sdk/os.c"]["compiler_version"], "GC/1.2.5")
+        self.assertEqual(rows["src/sdk/os.c"]["flags"],
+                         ["-O4,p", "-pragma", "cats off", "-cwd", "source", "-DX=1"])
+        self.assertTrue(rows["src/sdk/os.c"]["sjis"])
+        self.assertEqual(rows["src/game/main.c"]["compiler_version"], "GC/1.3")
+        self.assertFalse(rows["src/game/main.c"]["sjis"])
+
+
     def test_configure_parser_only_accepts_literal_matching_objects_in_named_libraries(self):
         source = """
 Matching = True

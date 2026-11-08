@@ -83,6 +83,13 @@ class DraftTests(unittest.TestCase):
 
         self.assertEqual([row["symbol"] for row in rows], ["fn_80001008"])
 
+    def test_holdout_selects_only_exact_functions(self):
+        with patch.object(drafts.m2c_context, "_report_exact_rows",
+                          return_value=[{"symbol": "fn_80001000"}]):
+            rows = drafts.candidates(self.root, "TEST01", 8, 8, matched=True)
+
+        self.assertEqual([row["symbol"] for row in rows], ["fn_80001000"])
+
     def test_address_range_limits_targeted_sweep(self):
         translated = {"status": "ok", "draft": "void f(void) {}", "context_mode": "assembly_only",
                       "diagnostics": {}, "artifacts": "ignored/draft"}
